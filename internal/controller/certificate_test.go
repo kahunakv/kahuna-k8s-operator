@@ -53,11 +53,11 @@ func TestCertificateRequestsAPKCS12Keystore(t *testing.T) {
 	if name != "kahuna-tls-password" {
 		t.Errorf("password secret = %q, want kahuna-tls-password", name)
 	}
-	if got := obj.GetName(); got != "kahuna-tls" {
+	if got := obj.GetName(); got != testTLSSecret {
 		t.Errorf("certificate name = %q, want kahuna-tls", got)
 	}
 	secretName, _, _ := unstructured.NestedString(obj.Object, "spec", "secretName")
-	if secretName != "kahuna-tls" {
+	if secretName != testTLSSecret {
 		t.Errorf("secretName = %q, want kahuna-tls", secretName)
 	}
 }
@@ -166,7 +166,7 @@ func TestSuppliedKeystoreIsUsedVerbatim(t *testing.T) {
 	if ref == nil || ref.Name != "my-pw" || ref.Key != "pw" {
 		t.Errorf("password ref = %+v, want my-pw/pw", ref)
 	}
-	if got := tlsSecretName(c); got != "kahuna-tls" {
+	if got := tlsSecretName(c); got != testTLSSecret {
 		t.Errorf("tlsSecretName = %q", got)
 	}
 }

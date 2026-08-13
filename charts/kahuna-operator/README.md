@@ -63,7 +63,7 @@ kubectl delete crd kahunaclusters.kahuna.kahunakv.io   # destroys all managed cl
 | `image.tag` | `""` | Defaults to `.Chart.AppVersion`. |
 | `replicaCount` | `1` | Above 1 is safe — leader election keeps one active reconciler; extras only shorten failover. |
 | `leaderElection.enabled` | `true` | Required if `replicaCount > 1`. |
-| `watchNamespace` | `""` | Restrict the operator to one namespace. Empty watches all. |
+| `watchNamespace` | `""` | Restrict the operator to one namespace by scoping its cache. Empty watches all. RBAC stays cluster-scoped, so this is a scoping control, not a security boundary. |
 | `rbac.create` | `true` | Disable only if you manage the ClusterRole yourself. |
 | `crds.install` | `true` | See the caveat above. |
 | `metrics.enabled` | `true` | controller-runtime metrics on `:8443` behind authn/authz. |

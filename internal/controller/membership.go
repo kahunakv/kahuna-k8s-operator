@@ -19,7 +19,7 @@ package controller
 import (
 	"context"
 	"fmt"
-	"sort"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -37,17 +37,18 @@ func podBaseURL(cluster *kahunav1alpha1.KahunaCluster, pod *corev1.Pod) string {
 	return fmt.Sprintf("http://%s:%d", pod.Status.PodIP, ports(cluster).HTTP)
 }
 
-// ordinalOf extracts the StatefulSet ordinal from a pod name.
-func ordinalOf(pod string) (int32, bool) {
+// ordinalOf extracts the StatefulSet ordinal from a pod name, or -1 when the name does not carry
+// one. Only ordering uses this, so an unparseable name sorts first rather than failing a reconcile.
+func ordinalOf(pod string) int32 {
 	idx := strings.LastIndex(pod, "-")
 	if idx < 0 {
-		return 0, false
+		return -1
 	}
 	n, err := strconv.Atoi(pod[idx+1:])
 	if err != nil || n < 0 {
-		return 0, false
+		return -1
 	}
-	return int32(n), true
+	return int32(n)
 }
 
 // podIsReady reports whether the kubelet considers the pod ready — which, given the readiness
@@ -74,14 +75,15 @@ func (r *KahunaClusterReconciler) readMembership(ctx context.Context, cluster *k
 		}
 	}
 	// Ready pods first, then by ordinal so the choice is deterministic and the logs are stable.
-	sort.SliceStable(candidates, func(i, j int) bool {
-		ri, rj := podIsReady(&candidates[i]), podIsReady(&candidates[j])
-		if ri != rj {
-			return ri
+	slices.SortStableFunc(candidates, func(a, b corev1.Pod) int {
+		ra, rb := podIsReady(&a), podIsReady(&b)
+		if ra != rb {
+			if ra {
+				return -1
+			}
+			return 1
 		}
-		oi, _ := ordinalOf(candidates[i].Name)
-		oj, _ := ordinalOf(candidates[j].Name)
-		return oi < oj
+		return int(ordinalOf(a.Name) - ordinalOf(b.Name))
 	})
 
 	var lastErr error
@@ -113,7 +115,7 @@ func buildMemberStatus(cluster *kahunav1alpha1.KahunaCluster, m *kahuna.Membersh
 	// Roster endpoints are the per-pod DNS names the operator generated, so they map back to
 	// ordinals without parsing the address.
 	endpointToPod := make(map[string]string)
-	for ordinal := int32(0); ordinal < int32(len(pods))+desiredReplicas(cluster); ordinal++ {
+	for ordinal := range int32(len(pods)) + desiredReplicas(cluster) {
 		endpointToPod[raftEndpoint(cluster, ordinal)] = podName(cluster, ordinal)
 	}
 
@@ -133,7 +135,9 @@ func buildMemberStatus(cluster *kahunav1alpha1.KahunaCluster, m *kahuna.Membersh
 		}
 		out = append(out, st)
 	}
-	sort.Slice(out, func(i, j int) bool { return out[i].Endpoint < out[j].Endpoint })
+	slices.SortFunc(out, func(a, b kahunav1alpha1.MemberStatus) int {
+		return strings.Compare(a.Endpoint, b.Endpoint)
+	})
 	return out
 }
 

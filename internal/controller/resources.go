@@ -17,6 +17,8 @@ limitations under the License.
 package controller
 
 import (
+	"maps"
+
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	policyv1 "k8s.io/api/policy/v1"
@@ -50,8 +52,8 @@ func desiredPeerService(cluster *kahunav1alpha1.KahunaCluster) *corev1.Service {
 			PublishNotReadyAddresses: true,
 			Selector:                 selectorLabels(cluster),
 			Ports: []corev1.ServicePort{
-				{Name: "http", Port: p.HTTP, TargetPort: intstr.FromInt32(p.HTTP), Protocol: corev1.ProtocolTCP},
-				{Name: "https", Port: p.HTTPS, TargetPort: intstr.FromInt32(p.HTTPS), Protocol: corev1.ProtocolTCP},
+				{Name: portNameHTTP, Port: p.HTTP, TargetPort: intstr.FromInt32(p.HTTP), Protocol: corev1.ProtocolTCP},
+				{Name: portNameHTTPS, Port: p.HTTPS, TargetPort: intstr.FromInt32(p.HTTPS), Protocol: corev1.ProtocolTCP},
 				{Name: "internal-http", Port: p.InternalHTTP, TargetPort: intstr.FromInt32(p.InternalHTTP), Protocol: corev1.ProtocolTCP},
 				{Name: "raft", Port: p.Raft, TargetPort: intstr.FromInt32(p.Raft), Protocol: corev1.ProtocolTCP},
 			},
@@ -69,8 +71,8 @@ func desiredClientService(cluster *kahunav1alpha1.KahunaCluster) *corev1.Service
 			Type:     corev1.ServiceTypeClusterIP,
 			Selector: selectorLabels(cluster),
 			Ports: []corev1.ServicePort{
-				{Name: "http", Port: p.HTTP, TargetPort: intstr.FromInt32(p.HTTP), Protocol: corev1.ProtocolTCP},
-				{Name: "https", Port: p.HTTPS, TargetPort: intstr.FromInt32(p.HTTPS), Protocol: corev1.ProtocolTCP},
+				{Name: portNameHTTP, Port: p.HTTP, TargetPort: intstr.FromInt32(p.HTTP), Protocol: corev1.ProtocolTCP},
+				{Name: portNameHTTPS, Port: p.HTTPS, TargetPort: intstr.FromInt32(p.HTTPS), Protocol: corev1.ProtocolTCP},
 			},
 		},
 	}
@@ -243,9 +245,7 @@ func desiredStatefulSet(cluster *kahunav1alpha1.KahunaCluster, partition int32) 
 	// Only the script is hashed. Topology is excluded on purpose so that a scale does not roll
 	// the cluster; see topologyEnv.
 	annotations := map[string]string{configHashAnnotation: configHash(entrypointScript(cluster))}
-	for k, v := range cluster.Spec.PodAnnotations {
-		annotations[k] = v
-	}
+	maps.Copy(annotations, cluster.Spec.PodAnnotations)
 
 	claims := []corev1.PersistentVolumeClaim{volumeClaim(dataVolumeName, cluster.Spec.Storage.Data)}
 	if cluster.Spec.Storage.WAL != nil {
@@ -308,8 +308,8 @@ func desiredStatefulSet(cluster *kahunav1alpha1.KahunaCluster, partition int32) 
 						SecurityContext: cluster.Spec.SecurityContext,
 						VolumeMounts:    podVolumeMounts(cluster),
 						Ports: []corev1.ContainerPort{
-							{Name: "http", ContainerPort: p.HTTP, Protocol: corev1.ProtocolTCP},
-							{Name: "https", ContainerPort: p.HTTPS, Protocol: corev1.ProtocolTCP},
+							{Name: portNameHTTP, ContainerPort: p.HTTP, Protocol: corev1.ProtocolTCP},
+							{Name: portNameHTTPS, ContainerPort: p.HTTPS, Protocol: corev1.ProtocolTCP},
 							{Name: "internal-http", ContainerPort: p.InternalHTTP, Protocol: corev1.ProtocolTCP},
 							{Name: "raft", ContainerPort: p.Raft, Protocol: corev1.ProtocolTCP},
 						},

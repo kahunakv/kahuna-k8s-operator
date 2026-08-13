@@ -76,7 +76,7 @@ func (f *fakeKahuna) Leave(_ context.Context, baseURL string) (*kahuna.LeaveResu
 // rosterOf builds a roster of Voters for ordinals 0..n-1 of the given cluster.
 func rosterOf(cluster *kahunav1alpha1.KahunaCluster, n int32) *kahuna.Membership {
 	m := &kahuna.Membership{MembershipVersion: int64(n), Initialized: true, LocalRole: kahuna.RoleVoter}
-	for i := int32(0); i < n; i++ {
+	for i := range n {
 		m.Members = append(m.Members, kahuna.Member{
 			Endpoint: raftEndpoint(cluster, i),
 			NodeID:   nodeIDForOrdinal(i),
@@ -110,7 +110,7 @@ var _ = Describe("KahunaCluster Controller", func() {
 					Data:    kahunav1alpha1.VolumeSpec{Size: resource.MustParse("1Gi")},
 				},
 				TLS: kahunav1alpha1.TLSSpec{
-					SecretRef: &corev1.LocalObjectReference{Name: "kahuna-tls"},
+					SecretRef: &corev1.LocalObjectReference{Name: testTLSSecret},
 				},
 			},
 		}
@@ -120,7 +120,7 @@ var _ = Describe("KahunaCluster Controller", func() {
 	// reconciler reaches nodes by pod IP, so a roster is only observable when pods carrying one
 	// exist.
 	ensurePods := func(n int32) {
-		for i := int32(0); i < n; i++ {
+		for i := range n {
 			pod := &corev1.Pod{
 				ObjectMeta: metav1.ObjectMeta{
 					Name:      podName(cluster, i),
@@ -151,10 +151,7 @@ var _ = Describe("KahunaCluster Controller", func() {
 			return
 		}
 		want := *sts.Spec.Replicas
-		ready := want
-		if rosterSize < ready {
-			ready = rosterSize
-		}
+		ready := min(rosterSize, want)
 		sts.Status.Replicas = want
 		sts.Status.ReadyReplicas = ready
 		sts.Status.CurrentReplicas = want
@@ -420,7 +417,7 @@ var _ = Describe("KahunaCluster Controller", func() {
 		before := getSTS().Spec.Template.Annotations[configHashAnnotation]
 
 		obj := getCluster()
-		obj.Spec.ExtraArgs = []string{"--max-concurrent-sessions", "1"}
+		obj.Spec.ExtraArgs = []string{flagMaxSessions, "1"}
 		Expect(k8sClient.Update(ctx, obj)).To(Succeed())
 		reconcileWith(rosterOf(cluster, 3), nil)
 

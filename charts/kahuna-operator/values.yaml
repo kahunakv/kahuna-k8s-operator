@@ -17,8 +17,11 @@ replicaCount: 1
 leaderElection:
   enabled: true
 
-# watchNamespace scopes the operator to a single namespace. Empty means all namespaces, which is
-# what the ClusterRole below grants.
+# watchNamespace scopes the operator to a single namespace. Empty means all namespaces.
+#
+# This restricts the operator's cache, which is what decides which KahunaClusters get reconciled.
+# RBAC stays cluster-scoped either way, so treat it as a scoping control rather than a security
+# boundary: the operator still *could* read across namespaces, it just does not watch them.
 watchNamespace: ""
 
 serviceAccount:

@@ -20,6 +20,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
@@ -31,9 +32,17 @@ import (
 	kahunav1alpha1 "github.com/kahunakv/k8s-operator/api/v1alpha1"
 )
 
+// Shared test fixtures. Named constants because the linter — correctly — objects to the same
+// literal appearing across many assertions.
+const (
+	testClusterName = "kahuna"
+	testTLSSecret   = "kahuna-tls"
+	flagMaxSessions = "--max-concurrent-sessions"
+)
+
 func testCluster(replicas int32) *kahunav1alpha1.KahunaCluster {
 	return &kahunav1alpha1.KahunaCluster{
-		ObjectMeta: metav1.ObjectMeta{Name: "kahuna", Namespace: "kv"},
+		ObjectMeta: metav1.ObjectMeta{Name: testClusterName, Namespace: "kv"},
 		Spec: kahunav1alpha1.KahunaClusterSpec{
 			Replicas:   ptr.To(replicas),
 			Image:      "kahunakv/kahuna:latest",
@@ -43,7 +52,7 @@ func testCluster(replicas int32) *kahunav1alpha1.KahunaCluster {
 				Data:    kahunav1alpha1.VolumeSpec{Size: resource.MustParse("10Gi")},
 			},
 			TLS: kahunav1alpha1.TLSSpec{
-				SecretRef:          &corev1.LocalObjectReference{Name: "kahuna-tls"},
+				SecretRef:          &corev1.LocalObjectReference{Name: testTLSSecret},
 				InsecureSkipVerify: ptr.To(true),
 			},
 		},
@@ -99,7 +108,7 @@ func runEntrypoint(t *testing.T, cluster *kahunav1alpha1.KahunaCluster, bootstra
 	}
 
 	var args []string
-	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+	for line := range strings.SplitSeq(strings.TrimSpace(string(out)), "\n") {
 		if line = strings.TrimSpace(line); line != "" && !strings.HasPrefix(line, "+ ") {
 			args = append(args, line)
 		}
@@ -135,12 +144,7 @@ func argValues(args []string, flag string) []string {
 }
 
 func hasFlag(args []string, flag string) bool {
-	for _, a := range args {
-		if a == flag {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(args, flag)
 }
 
 func TestEntrypointDerivesNodeIdentityFromOrdinal(t *testing.T) {
@@ -234,7 +238,7 @@ func TestEntrypointRejectsUnparseablePodName(t *testing.T) {
 
 func TestStaticArgsOmitUnsetTuningFlags(t *testing.T) {
 	args := staticArgs(testCluster(3))
-	for _, flag := range []string{"--raft-suspicion-timeout", "--locks-workers", "--max-concurrent-sessions"} {
+	for _, flag := range []string{"--raft-suspicion-timeout", "--locks-workers", flagMaxSessions} {
 		if hasFlag(args, flag) {
 			t.Errorf("%s emitted although unset; the server default should apply instead", flag)
 		}
@@ -252,7 +256,7 @@ func TestStaticArgsEmitSetTuningFlags(t *testing.T) {
 	cluster := testCluster(3)
 	cluster.Spec.Raft = &kahunav1alpha1.RaftSpec{SuspicionTimeoutMs: ptr.To(int32(9000))}
 	cluster.Spec.Storage.SyncWrites = ptr.To(false)
-	cluster.Spec.ExtraArgs = []string{"--max-concurrent-sessions", "1"}
+	cluster.Spec.ExtraArgs = []string{flagMaxSessions, "1"}
 
 	args := staticArgs(cluster)
 	if got := argValues(args, "--raft-suspicion-timeout"); len(got) != 1 || got[0] != "9000" {
@@ -261,7 +265,7 @@ func TestStaticArgsEmitSetTuningFlags(t *testing.T) {
 	if !hasFlag(args, "--disable-wal-sync-writes") {
 		t.Error("--disable-wal-sync-writes missing although syncWrites is false")
 	}
-	if got := argValues(args, "--max-concurrent-sessions"); len(got) != 1 || got[0] != "1" {
+	if got := argValues(args, flagMaxSessions); len(got) != 1 || got[0] != "1" {
 		t.Errorf("extraArgs not appended: %v", args)
 	}
 }
@@ -296,7 +300,7 @@ func TestConfigHashChangesWithConfiguration(t *testing.T) {
 	}
 
 	extra := testCluster(3)
-	extra.Spec.ExtraArgs = []string{"--max-concurrent-sessions", "1"}
+	extra.Spec.ExtraArgs = []string{flagMaxSessions, "1"}
 	if configHash(entrypointScript(extra)) == base {
 		t.Error("config hash did not change when extraArgs changed")
 	}

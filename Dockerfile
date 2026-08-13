@@ -1,5 +1,10 @@
-# Build the manager binary
-FROM golang:1.26 AS builder
+# Build the manager binary.
+#
+# The builder is pinned to the NATIVE build platform while the binary is cross-compiled through
+# GOOS/GOARCH below. Without the pin, a multi-arch buildx run emulates the whole Go toolchain under
+# QEMU for every non-native architecture — minutes of emulated compilation to produce a binary the
+# native toolchain can cross-compile directly.
+FROM --platform=$BUILDPLATFORM golang:1.26 AS builder
 ARG TARGETOS
 ARG TARGETARCH
 

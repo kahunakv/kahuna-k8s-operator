@@ -18,6 +18,7 @@ package controller
 
 import (
 	"fmt"
+	"maps"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
@@ -54,6 +55,13 @@ const (
 	tlsPasswordVolumeName = "tls-password"
 
 	containerName = "kahuna"
+
+	// appName is the app.kubernetes.io/name every owned object carries.
+	appName = "kahuna"
+
+	// portNameHTTP and portNameHTTPS name the client-facing ports on both Services.
+	portNameHTTP  = "http"
+	portNameHTTPS = "https"
 
 	// configHashAnnotation carries a digest of the generated startup script. It lives on the pod
 	// template so that a config change produces a new template revision — a ConfigMap edit alone
@@ -111,7 +119,7 @@ func nodeIDForOrdinal(ordinal int32) int32 { return ordinal + 1 }
 // changed after creation, so nothing that varies with the spec may appear here.
 func selectorLabels(cluster *kahunav1alpha1.KahunaCluster) map[string]string {
 	return map[string]string{
-		"app.kubernetes.io/name":     "kahuna",
+		"app.kubernetes.io/name":     appName,
 		"app.kubernetes.io/instance": cluster.Name,
 	}
 }
@@ -122,13 +130,9 @@ func podLabels(cluster *kahunav1alpha1.KahunaCluster) map[string]string {
 		"app.kubernetes.io/component":  "server",
 		"app.kubernetes.io/managed-by": "kahuna-operator",
 	}
-	for k, v := range cluster.Spec.PodLabels {
-		out[k] = v
-	}
+	maps.Copy(out, cluster.Spec.PodLabels)
 	// Selector labels are applied last so a user-supplied label cannot break the selector match.
-	for k, v := range selectorLabels(cluster) {
-		out[k] = v
-	}
+	maps.Copy(out, selectorLabels(cluster))
 	return out
 }
 
@@ -165,10 +169,4 @@ func desiredReplicas(cluster *kahunav1alpha1.KahunaCluster) int32 {
 		return 3
 	}
 	return *cluster.Spec.Replicas
-}
-
-// standalone reports whether this cluster is a single-node deployment. A single node gets an
-// empty --initial-cluster, which is how the Kahuna server selects its embedded/standalone mode.
-func standalone(cluster *kahunav1alpha1.KahunaCluster) bool {
-	return desiredReplicas(cluster) == 1
 }

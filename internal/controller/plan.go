@@ -47,7 +47,7 @@ func rosterMatches(cluster *kahunav1alpha1.KahunaCluster, m *kahuna.Membership, 
 	if int32(len(m.Members)) != replicas {
 		return false
 	}
-	for i := int32(0); i < replicas; i++ {
+	for i := range replicas {
 		if !m.HasVoter(raftEndpoint(cluster, i)) {
 			return false
 		}
@@ -105,13 +105,13 @@ func rosterHoldReason(cluster *kahunav1alpha1.KahunaCluster, m *kahuna.Membershi
 		return "waiting for cluster membership to become readable"
 	}
 	var missing, extra []string
-	for i := int32(0); i < replicas; i++ {
+	for i := range replicas {
 		if !m.HasVoter(raftEndpoint(cluster, i)) {
 			missing = append(missing, podName(cluster, i))
 		}
 	}
 	expected := make(map[string]bool, replicas)
-	for i := int32(0); i < replicas; i++ {
+	for i := range replicas {
 		expected[raftEndpoint(cluster, i)] = true
 	}
 	for _, mem := range m.Members {
