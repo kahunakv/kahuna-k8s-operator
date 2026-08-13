@@ -104,9 +104,17 @@ jobs:
 
       # Chart version and appVersion come from the tag rather than from Chart.yaml, so a release
       # cannot ship a chart that claims a different version than the image it deploys.
+      # The chart's default image is rewritten from the repository being released, for the same
+      # reason the version is derived from the tag: a hand-maintained default silently goes stale.
+      # It already did once — the checked-in value survived a repository rename and shipped a
+      # chart whose default image had never been published.
       - name: Package and push the Helm chart
+        env:
+          IMAGE_REF: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
         run: |
           ./hack/sync-helm.sh
+          yq -i '.image.repository = strenv(IMAGE_REF)' charts/kahuna-operator/values.yaml
+          echo "chart default image: $(yq '.image.repository' charts/kahuna-operator/values.yaml)"
           helm package charts/kahuna-operator \
             --version "${{ steps.version.outputs.semver }}" \
             --app-version "${{ steps.version.outputs.version }}" \

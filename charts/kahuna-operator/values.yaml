@@ -1,7 +1,9 @@
 # Default values for kahuna-operator.
 
 image:
-  repository: ghcr.io/kahunakv/k8s-operator
+  # Overwritten at package time from the repository the release is built in, so the chart cannot
+  # ship a default pointing at an image that was never published.
+  repository: ghcr.io/kahunakv/kahuna-k8s-operator
   # Defaults to .Chart.AppVersion when empty.
   tag: ""
   pullPolicy: IfNotPresent

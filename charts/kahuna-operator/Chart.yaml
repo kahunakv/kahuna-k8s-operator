@@ -3,11 +3,15 @@ name: kahuna-operator
 description: Kubernetes operator for Kahuna — a distributed key/value store, lock manager and sequencer built on Raft consensus
 type: application
 # version is the chart version; appVersion tracks the operator release the default image points at.
-version: 0.1.0
-appVersion: "0.1.0"
-home: https://github.com/kahunakv/k8s-operator
+#
+# Both are overridden at package time from the release tag. They are kept accurate here anyway so
+# that `helm install ./charts/kahuna-operator` from a source checkout resolves a real image —
+# appVersion carries the v prefix because that is how the images are tagged.
+version: 0.1.1
+appVersion: "v0.1.1"
+home: https://github.com/kahunakv/kahuna-k8s-operator
 sources:
-  - https://github.com/kahunakv/k8s-operator
+  - https://github.com/kahunakv/kahuna-k8s-operator
   - https://github.com/kahunakv/kahuna
 keywords:
   - kahuna

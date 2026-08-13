@@ -59,7 +59,7 @@ kubectl delete crd kahunaclusters.kahuna.kahunakv.io   # destroys all managed cl
 
 | Key | Default | Description |
 |---|---|---|
-| `image.repository` | `ghcr.io/kahunakv/k8s-operator` | Operator image. |
+| `image.repository` | `ghcr.io/kahunakv/kahuna-k8s-operator` | Operator image. Set at package time from the release repository. |
 | `image.tag` | `""` | Defaults to `.Chart.AppVersion`. |
 | `replicaCount` | `1` | Above 1 is safe — leader election keeps one active reconciler; extras only shorten failover. |
 | `leaderElection.enabled` | `true` | Required if `replicaCount > 1`. |
