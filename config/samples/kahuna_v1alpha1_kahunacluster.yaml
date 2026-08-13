@@ -1,0 +1,33 @@
+apiVersion: kahuna.kahunakv.io/v1alpha1
+kind: KahunaCluster
+metadata:
+  labels:
+    app.kubernetes.io/name: kahuna-operator
+    app.kubernetes.io/managed-by: kustomize
+  name: kahuna
+spec:
+  # 3 tolerates one node failure. 2 is rejected (a quorum of 2 tolerates none) and 1 selects
+  # standalone mode, which cannot later be grown into a real cluster.
+  replicas: 3
+  image: kahunakv/kahuna:dev
+  imagePullPolicy: IfNotPresent
+  # Fixed at bootstrap: the partition map is built once and changing the count later would
+  # orphan it, so the CRD rejects the edit.
+  partitions: 3
+  storage:
+    backend: rocksdb
+    data:
+      size: 5Gi
+  tls:
+    # A cluster always needs a PKCS#12 keystore: the Raft port is an HTTPS listener and
+    # inter-node gRPC speaks https://.
+    secretRef:
+      name: kahuna-tls
+    keystoreKey: certificate.pfx
+    # The development keystore is self-signed and not in the image's trust store.
+    insecureSkipVerify: true
+  logLevel: Information
+  resources:
+    requests:
+      cpu: 250m
+      memory: 512Mi

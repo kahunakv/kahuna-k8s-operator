@@ -1,0 +1,4 @@
+## Append samples of your project ##
+resources:
+- kahuna_v1alpha1_kahunacluster.yaml
+# +kubebuilder:scaffold:manifestskustomizesamples

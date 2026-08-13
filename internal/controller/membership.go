@@ -1,0 +1,151 @@
+/*
+Copyright 2026.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package controller
+
+import (
+	"context"
+	"fmt"
+	"sort"
+	"strconv"
+	"strings"
+
+	corev1 "k8s.io/api/core/v1"
+
+	kahunav1alpha1 "github.com/kahunakv/k8s-operator/api/v1alpha1"
+	"github.com/kahunakv/k8s-operator/internal/kahuna"
+)
+
+// podBaseURL addresses a pod by IP rather than by its DNS name. Pod IPs are reachable from the
+// operator without depending on cluster DNS resolving inside the operator's own network
+// namespace, which matters when the manager runs outside the cluster during development.
+func podBaseURL(cluster *kahunav1alpha1.KahunaCluster, pod *corev1.Pod) string {
+	return fmt.Sprintf("http://%s:%d", pod.Status.PodIP, ports(cluster).HTTP)
+}
+
+// ordinalOf extracts the StatefulSet ordinal from a pod name.
+func ordinalOf(pod string) (int32, bool) {
+	idx := strings.LastIndex(pod, "-")
+	if idx < 0 {
+		return 0, false
+	}
+	n, err := strconv.Atoi(pod[idx+1:])
+	if err != nil || n < 0 {
+		return 0, false
+	}
+	return int32(n), true
+}
+
+// podIsReady reports whether the kubelet considers the pod ready — which, given the readiness
+// probe points at /v1/cluster/health, means the node is initialized and holds a serving role.
+func podIsReady(pod *corev1.Pod) bool {
+	for _, c := range pod.Status.Conditions {
+		if c.Type == corev1.PodReady {
+			return c.Status == corev1.ConditionTrue
+		}
+	}
+	return false
+}
+
+// readMembership asks the cluster for its committed roster.
+//
+// Any node can answer, so it tries ready pods first and falls back to merely running ones: during
+// bootstrap no pod is ready yet, but they can already answer membership queries, and that early
+// view is exactly what tells the operator whether the roster has been seeded.
+func (r *KahunaClusterReconciler) readMembership(ctx context.Context, cluster *kahunav1alpha1.KahunaCluster, pods []corev1.Pod) (*kahuna.Membership, error) {
+	candidates := make([]corev1.Pod, 0, len(pods))
+	for _, p := range pods {
+		if p.Status.PodIP != "" && p.DeletionTimestamp == nil {
+			candidates = append(candidates, p)
+		}
+	}
+	// Ready pods first, then by ordinal so the choice is deterministic and the logs are stable.
+	sort.SliceStable(candidates, func(i, j int) bool {
+		ri, rj := podIsReady(&candidates[i]), podIsReady(&candidates[j])
+		if ri != rj {
+			return ri
+		}
+		oi, _ := ordinalOf(candidates[i].Name)
+		oj, _ := ordinalOf(candidates[j].Name)
+		return oi < oj
+	})
+
+	var lastErr error
+	for i := range candidates {
+		m, err := r.Kahuna.Membership(ctx, podBaseURL(cluster, &candidates[i]))
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		return m, nil
+	}
+	if lastErr == nil {
+		lastErr = fmt.Errorf("no pod was reachable")
+	}
+	return nil, lastErr
+}
+
+// buildMemberStatus joins the committed roster to the pods serving it.
+//
+// The join is the interesting part: a roster entry with no pod is a member the cluster still
+// counts but Kubernetes no longer runs — a node evicted from the StatefulSet whose removal has
+// not yet been committed, which is precisely the state scale-down waits out.
+func buildMemberStatus(cluster *kahunav1alpha1.KahunaCluster, m *kahuna.Membership, pods []corev1.Pod) []kahunav1alpha1.MemberStatus {
+	byName := make(map[string]*corev1.Pod, len(pods))
+	for i := range pods {
+		byName[pods[i].Name] = &pods[i]
+	}
+
+	// Roster endpoints are the per-pod DNS names the operator generated, so they map back to
+	// ordinals without parsing the address.
+	endpointToPod := make(map[string]string)
+	for ordinal := int32(0); ordinal < int32(len(pods))+desiredReplicas(cluster); ordinal++ {
+		endpointToPod[raftEndpoint(cluster, ordinal)] = podName(cluster, ordinal)
+	}
+
+	out := make([]kahunav1alpha1.MemberStatus, 0, len(m.Members))
+	for _, mem := range m.Members {
+		st := kahunav1alpha1.MemberStatus{
+			Endpoint:      mem.Endpoint,
+			NodeID:        mem.NodeID,
+			Role:          mem.Role,
+			JoinedVersion: mem.JoinedVersion,
+		}
+		if name, ok := endpointToPod[mem.Endpoint]; ok {
+			st.PodName = name
+			if pod, ok := byName[name]; ok {
+				st.Ready = podIsReady(pod)
+			}
+		}
+		out = append(out, st)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Endpoint < out[j].Endpoint })
+	return out
+}
+
+// countRoles tallies the roster by role. Only Voters count toward quorum; Learners are still
+// catching up and do not help a cluster make progress.
+func countRoles(members []kahunav1alpha1.MemberStatus) (voters, learners int32) {
+	for _, m := range members {
+		switch m.Role {
+		case kahuna.RoleVoter:
+			voters++
+		case kahuna.RoleLearner:
+			learners++
+		}
+	}
+	return voters, learners
+}
