@@ -93,13 +93,45 @@ type Health struct {
 	LocalRole   string `json:"localRole"`
 }
 
-// Client reads cluster state from a Kahuna node.
+// Leave outcomes reported by POST /v1/cluster/leave.
+const (
+	// OutcomeCommitted means the RemoveMember entry is committed: the node is out of the roster
+	// and surviving members no longer count it toward quorum.
+	OutcomeCommitted = "Committed"
+	// OutcomeNotAMember means the endpoint was already absent. Success, for idempotency.
+	OutcomeNotAMember = "NotAMember"
+	// OutcomeRefusedInsufficientVoters means the removal would leave zero voters. Permanent:
+	// retrying can never succeed while the roster is unchanged.
+	OutcomeRefusedInsufficientVoters = "RefusedInsufficientVoters"
+)
+
+// LeaveResult is the response of POST /v1/cluster/leave.
+type LeaveResult struct {
+	Left              bool   `json:"left"`
+	Outcome           string `json:"outcome"`
+	MembershipVersion int64  `json:"membershipVersion"`
+	Retryable         bool   `json:"retryable"`
+	Reason            string `json:"reason"`
+}
+
+// Removed reports whether the node is out of the roster — either because this call committed the
+// removal or because it was already gone. Both mean the pod is safe to stop.
+func (l *LeaveResult) Removed() bool {
+	return l.Outcome == OutcomeCommitted || l.Outcome == OutcomeNotAMember
+}
+
+// Client reads cluster state from a Kahuna node, and asks one to decommission itself.
 type Client interface {
 	// Membership returns the committed roster as seen by the node at baseURL.
 	Membership(ctx context.Context, baseURL string) (*Membership, error)
 	// Health returns the node's readiness. A 503 is a valid answer, not an error: it means the
 	// node is up but cannot serve.
 	Health(ctx context.Context, baseURL string) (*Health, error)
+	// Leave asks the node to remove itself from the committed roster. Every documented outcome
+	// comes back as a result rather than an error, because a caller driving a scale-down has to
+	// tell "the node is out" from "nothing happened" — and only a transport failure is genuinely
+	// unclassifiable.
+	Leave(ctx context.Context, baseURL string) (*LeaveResult, error)
 }
 
 // HTTPClient talks to the plaintext client port. The operator deliberately uses HTTP rather than
@@ -164,4 +196,35 @@ func (c *HTTPClient) Health(ctx context.Context, baseURL string) (*Health, error
 		return nil, fmt.Errorf("health query returned HTTP %d", code)
 	}
 	return &h, nil
+}
+
+// Leave implements Client.
+//
+// The server answers every documented outcome with a body — 200 committed or already-gone, 409 the
+// permanent last-voter refusal, 503 not-initialized or no-leader, 504 unresolved before the
+// deadline — so the status code is not consulted here beyond decoding. The caller branches on
+// Outcome, which carries the distinction that matters.
+func (c *HTTPClient) Leave(ctx context.Context, baseURL string) (*LeaveResult, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, baseURL+"/v1/cluster/leave", nil)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := c.HTTP.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if err != nil {
+		return nil, err
+	}
+	var out LeaveResult
+	if err := json.Unmarshal(body, &out); err != nil {
+		return nil, fmt.Errorf("decoding leave response (status %d): %w", resp.StatusCode, err)
+	}
+	if out.Outcome == "" {
+		return nil, fmt.Errorf("leave returned HTTP %d with no outcome", resp.StatusCode)
+	}
+	return &out, nil
 }

@@ -36,7 +36,21 @@ var (
 	managerImage = "example.com/kahuna-operator:v0.0.1"
 	// shouldCleanupCertManager tracks whether CertManager was installed by this suite.
 	shouldCleanupCertManager = false
+	// kahunaImage is the Kahuna server image under test.
+	//
+	// It is a pinned published tag rather than :latest so a green run stays green: an upstream
+	// image push must not turn an unrelated pull request red. Override it to test a locally built
+	// server, or bump it deliberately to pick up a new release.
+	kahunaImage = envOr("KAHUNA_IMAGE", "kahunakv/kahuna:1.0.8")
 )
+
+// envOr reads an environment variable with a fallback.
+func envOr(key, fallback string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return fallback
+}
 
 // TestE2E runs the e2e test suite to validate the solution in an isolated environment.
 // The default setup requires Kind and CertManager.
@@ -61,6 +75,14 @@ var _ = BeforeSuite(func() {
 	By("loading the manager image on Kind")
 	err = utils.LoadImageToKindClusterWithName(managerImage)
 	ExpectWithOffset(1, err).NotTo(HaveOccurred(), "Failed to load the manager image into Kind")
+
+	// Kind nodes cannot pull from the host's daemon, so the server image is pulled once here and
+	// sideloaded. Doing it in BeforeSuite also keeps the pull out of the per-spec timeouts.
+	By("pulling and loading the Kahuna server image " + kahunaImage)
+	_, err = utils.Run(exec.Command("docker", "pull", kahunaImage))
+	ExpectWithOffset(1, err).NotTo(HaveOccurred(), "Failed to pull the Kahuna server image")
+	err = utils.LoadImageToKindClusterWithName(kahunaImage)
+	ExpectWithOffset(1, err).NotTo(HaveOccurred(), "Failed to load the Kahuna server image into Kind")
 
 	configureKubectlKubeRC()
 	setupCertManager()

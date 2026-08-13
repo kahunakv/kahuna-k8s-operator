@@ -1,0 +1,23 @@
+apiVersion: v2
+name: kahuna-operator
+description: Kubernetes operator for Kahuna — a distributed key/value store, lock manager and sequencer built on Raft consensus
+type: application
+# version is the chart version; appVersion tracks the operator release the default image points at.
+version: 0.1.0
+appVersion: "0.1.0"
+home: https://github.com/kahunakv/k8s-operator
+sources:
+  - https://github.com/kahunakv/k8s-operator
+  - https://github.com/kahunakv/kahuna
+keywords:
+  - kahuna
+  - raft
+  - key-value
+  - distributed-locks
+  - operator
+maintainers:
+  - name: kahunakv
+annotations:
+  # cert-manager is optional: it is needed only by clusters that set spec.tls.certManager rather
+  # than supplying their own keystore Secret.
+  artifacthub.io/prerelease: "true"

@@ -188,7 +188,7 @@ func podVolumes(cluster *kahunav1alpha1.KahunaCluster) []corev1.Volume {
 		},
 	}}
 
-	if pw := cluster.Spec.TLS.PasswordSecretRef; pw != nil {
+	if pw := tlsPasswordRef(cluster); pw != nil {
 		vols = append(vols, corev1.Volume{
 			Name: tlsPasswordVolumeName,
 			VolumeSource: corev1.VolumeSource{
@@ -224,7 +224,7 @@ func podVolumeMounts(cluster *kahunav1alpha1.KahunaCluster) []corev1.VolumeMount
 		// WAL volume lands on top of the directory the data volume provides.
 		mounts = append(mounts, corev1.VolumeMount{Name: walVolumeName, MountPath: walPath})
 	}
-	if cluster.Spec.TLS.PasswordSecretRef != nil {
+	if tlsPasswordRef(cluster) != nil {
 		mounts = append(mounts, corev1.VolumeMount{
 			Name: tlsPasswordVolumeName, MountPath: tlsPasswordMountPath, ReadOnly: true,
 		})

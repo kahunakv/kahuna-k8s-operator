@@ -1,0 +1,79 @@
+# Default values for kahuna-operator.
+
+image:
+  repository: ghcr.io/kahunakv/k8s-operator
+  # Defaults to .Chart.AppVersion when empty.
+  tag: ""
+  pullPolicy: IfNotPresent
+
+imagePullSecrets: []
+nameOverride: ""
+fullnameOverride: ""
+
+# replicaCount above 1 is safe: leader election ensures exactly one instance reconciles at a time.
+# The extras exist to shorten failover, not to share the work.
+replicaCount: 1
+
+leaderElection:
+  enabled: true
+
+# watchNamespace scopes the operator to a single namespace. Empty means all namespaces, which is
+# what the ClusterRole below grants.
+watchNamespace: ""
+
+serviceAccount:
+  create: true
+  annotations: {}
+  name: ""
+
+rbac:
+  # Disable only if you manage the ClusterRole and binding yourself. The operator cannot function
+  # without equivalent permissions.
+  create: true
+
+crds:
+  # Helm installs files under crds/ on first install but never upgrades them. Leave this true for
+  # a normal install; see the chart README for what to do when upgrading across a CRD change.
+  install: true
+
+metrics:
+  # Serves controller-runtime metrics on 8443 behind authn/authz.
+  enabled: true
+  port: 8443
+  service:
+    annotations: {}
+  # Requires the Prometheus operator's CRDs to be installed.
+  serviceMonitor:
+    enabled: false
+    interval: 30s
+    labels: {}
+
+resources:
+  limits:
+    cpu: 500m
+    memory: 256Mi
+  requests:
+    cpu: 10m
+    memory: 128Mi
+
+# The manager needs no filesystem access and no elevated capabilities.
+podSecurityContext:
+  runAsNonRoot: true
+  seccompProfile:
+    type: RuntimeDefault
+
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop:
+      - ALL
+
+nodeSelector: {}
+tolerations: []
+affinity: {}
+podAnnotations: {}
+podLabels: {}
+
+# Extra arguments appended to the manager command line.
+extraArgs: []

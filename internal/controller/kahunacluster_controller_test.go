@@ -43,6 +43,12 @@ import (
 type fakeKahuna struct {
 	membership *kahuna.Membership
 	err        error
+	// leaveResult is what a decommission request returns; nil means a committed removal.
+	leaveResult *kahuna.LeaveResult
+	leaveErr    error
+	// leaveCalls records which base URLs were asked to leave, so a test can assert the operator
+	// asked before removing rather than just removing.
+	leaveCalls []string
 }
 
 func (f *fakeKahuna) Membership(context.Context, string) (*kahuna.Membership, error) {
@@ -54,6 +60,17 @@ func (f *fakeKahuna) Membership(context.Context, string) (*kahuna.Membership, er
 
 func (f *fakeKahuna) Health(context.Context, string) (*kahuna.Health, error) {
 	return &kahuna.Health{Ready: true, Initialized: true, LocalRole: kahuna.RoleVoter}, nil
+}
+
+func (f *fakeKahuna) Leave(_ context.Context, baseURL string) (*kahuna.LeaveResult, error) {
+	f.leaveCalls = append(f.leaveCalls, baseURL)
+	if f.leaveErr != nil {
+		return nil, f.leaveErr
+	}
+	if f.leaveResult != nil {
+		return f.leaveResult, nil
+	}
+	return &kahuna.LeaveResult{Left: true, Outcome: kahuna.OutcomeCommitted}, nil
 }
 
 // rosterOf builds a roster of Voters for ordinals 0..n-1 of the given cluster.
@@ -144,17 +161,23 @@ var _ = Describe("KahunaCluster Controller", func() {
 		Expect(k8sClient.Status().Update(ctx, sts)).To(Succeed())
 	}
 
-	// reconcile runs a pass with the given roster view.
-	reconcileWith := func(m *kahuna.Membership, err error) {
+	// reconcile runs a pass with the given roster view and returns the fake, so a test can assert
+	// on what the operator asked the cluster to do.
+	reconcileUsing := func(fake *fakeKahuna) *fakeKahuna {
 		n := int32(3)
-		if m != nil {
-			n = int32(len(m.Members))
+		if fake.membership != nil {
+			n = int32(len(fake.membership.Members))
 		}
 		ensurePods(n)
 		syncSTSStatus(n)
-		reconciler.Kahuna = &fakeKahuna{membership: m, err: err}
+		reconciler.Kahuna = fake
 		_, rerr := reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: nn})
 		Expect(rerr).NotTo(HaveOccurred())
+		return fake
+	}
+
+	reconcileWith := func(m *kahuna.Membership, err error) {
+		reconcileUsing(&fakeKahuna{membership: m, err: err})
 	}
 
 	getSTS := func() *appsv1.StatefulSet {
@@ -252,9 +275,10 @@ var _ = Describe("KahunaCluster Controller", func() {
 		reconcileWith(rosterOf(cluster, 4), nil)
 		Expect(*getSTS().Spec.Replicas).To(Equal(int32(5)))
 
-		reconcileWith(rosterOf(cluster, 5), nil)
+		fake := reconcileUsing(&fakeKahuna{membership: rosterOf(cluster, 5)})
 		Expect(*getSTS().Spec.Replicas).To(Equal(int32(5)))
 		Expect(getCluster().Status.Phase).To(Equal(kahunav1alpha1.PhaseRunning))
+		Expect(fake.leaveCalls).To(BeEmpty(), "growing the cluster asked a node to leave")
 	})
 
 	It("scales down one node at a time, waiting for the cluster to evict each one", func() {
@@ -283,6 +307,83 @@ var _ = Describe("KahunaCluster Controller", func() {
 
 		reconcileWith(rosterOf(cluster, 4), nil)
 		Expect(*getSTS().Spec.Replicas).To(Equal(int32(3)))
+	})
+
+	It("asks the departing node to leave before removing its pod", func() {
+		reconcileWith(rosterOf(cluster, 3), nil)
+		obj := getCluster()
+		obj.Spec.Replicas = ptr.To(int32(5))
+		Expect(k8sClient.Update(ctx, obj)).To(Succeed())
+		reconcileWith(rosterOf(cluster, 3), nil)
+		reconcileWith(rosterOf(cluster, 4), nil)
+		reconcileWith(rosterOf(cluster, 5), nil)
+
+		obj = getCluster()
+		obj.Spec.Replicas = ptr.To(int32(3))
+		Expect(k8sClient.Update(ctx, obj)).To(Succeed())
+
+		fake := reconcileUsing(&fakeKahuna{membership: rosterOf(cluster, 5)})
+
+		// The highest ordinal is the one the StatefulSet will delete, so it is the one that has to
+		// be out of the roster first.
+		Expect(fake.leaveCalls).To(HaveLen(1))
+		Expect(fake.leaveCalls[0]).To(ContainSubstring("10.244.0.5"), "asked the wrong node to leave")
+		Expect(*getSTS().Spec.Replicas).To(Equal(int32(4)),
+			"the pod was not removed after the node left")
+	})
+
+	It("keeps the node when it cannot be asked to leave", func() {
+		reconcileWith(rosterOf(cluster, 3), nil)
+		obj := getCluster()
+		obj.Spec.Replicas = ptr.To(int32(5))
+		Expect(k8sClient.Update(ctx, obj)).To(Succeed())
+		reconcileWith(rosterOf(cluster, 3), nil)
+		reconcileWith(rosterOf(cluster, 4), nil)
+		reconcileWith(rosterOf(cluster, 5), nil)
+
+		obj = getCluster()
+		obj.Spec.Replicas = ptr.To(int32(3))
+		Expect(k8sClient.Update(ctx, obj)).To(Succeed())
+
+		// Deleting a pod that is still a committed member is exactly what the leave call exists to
+		// avoid, so an unreachable node must stall the scale rather than fall back to it.
+		reconcileUsing(&fakeKahuna{
+			membership: rosterOf(cluster, 5),
+			leaveErr:   fmt.Errorf("connection refused"),
+		})
+		Expect(*getSTS().Spec.Replicas).To(Equal(int32(5)))
+
+		// A permanent refusal holds too, and must not be retried into a loop of pod deletions.
+		reconcileUsing(&fakeKahuna{
+			membership: rosterOf(cluster, 5),
+			leaveResult: &kahuna.LeaveResult{
+				Outcome:   kahuna.OutcomeRefusedInsufficientVoters,
+				Retryable: false,
+				Reason:    "would leave the cluster without a voter",
+			},
+		})
+		Expect(*getSTS().Spec.Replicas).To(Equal(int32(5)))
+	})
+
+	It("treats a node that already left as removable", func() {
+		reconcileWith(rosterOf(cluster, 3), nil)
+		obj := getCluster()
+		obj.Spec.Replicas = ptr.To(int32(5))
+		Expect(k8sClient.Update(ctx, obj)).To(Succeed())
+		reconcileWith(rosterOf(cluster, 3), nil)
+		reconcileWith(rosterOf(cluster, 4), nil)
+		reconcileWith(rosterOf(cluster, 5), nil)
+
+		obj = getCluster()
+		obj.Spec.Replicas = ptr.To(int32(3))
+		Expect(k8sClient.Update(ctx, obj)).To(Succeed())
+
+		// Idempotency: a retried scale step must not stall because the node is already gone.
+		reconcileUsing(&fakeKahuna{
+			membership:  rosterOf(cluster, 5),
+			leaveResult: &kahuna.LeaveResult{Outcome: kahuna.OutcomeNotAMember},
+		})
+		Expect(*getSTS().Spec.Replicas).To(Equal(int32(4)))
 	})
 
 	It("holds every node in place while the roster cannot be read", func() {

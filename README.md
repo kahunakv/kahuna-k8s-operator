@@ -36,7 +36,7 @@ kahuna   3         3       3        Running   12m
 |---|---|
 | **Provisions** | Headless peer Service, client Service, per-node PVCs, ConfigMap, PodDisruptionBudget, StatefulSet. |
 | **Bootstraps** | Brings up all founding nodes at once so they can form their first quorum, and reports `Running` only when the committed roster carries every node as a Voter. |
-| **Scales** | One node at a time, in both directions, each step gated on the roster — never on what Kubernetes merely believes. |
+| **Scales** | One node at a time, in both directions, each step gated on the roster — never on what Kubernetes merely believes. Departing nodes are decommissioned through the cluster's leave API before their pods are removed. |
 | **Upgrades** | Rolling restarts one node at a time, held back automatically whenever the roster is not converged or unreadable. |
 | **Reports** | `status.members` mirrors the committed roster joined to the pods serving it, plus `Available` / `Progressing` / `RosterConverged` conditions. |
 
@@ -76,10 +76,12 @@ not yet a serving member — a state every node passes through on restart, and o
 sit in. Restarting the process fixes neither. Liveness asks only whether the server answers at all;
 readiness carries the membership-aware check.
 
-**Scale-down waits for SWIM.** Graceful leave is a *startup* flag in Kahuna with no API, so the
-operator cannot ask a running node to decommission — it stops the pod and waits for the cluster to
-commit the eviction (~35s at default timeouts) before touching the next one. See
-[Known gaps](#known-gaps).
+**Scale-down decommissions before deleting.** The departing node is asked to leave through
+`POST /v1/cluster/leave`, and its pod is removed only once the cluster confirms the removal is
+committed (or that it was already gone). Deleting the pod first would make a planned removal
+indistinguishable from a crash and force the cluster through its failure-detector timeouts. If the
+node cannot be reached, or refuses because it is the last voter, the scale **holds** rather than
+falling back to deleting a live member.
 
 **`replicas: 2` is rejected, and 1 ↔ many is rejected.** A two-Voter cluster has a quorum of 2, so it
 tolerates no failures while costing twice as much as a single node. A single node runs Kahuna in
@@ -113,19 +115,59 @@ Changing configuration rolls the cluster; changing `replicas` does not.
 ## TLS
 
 TLS is not optional for a multi-node cluster: the Raft port is an HTTPS listener and inter-node gRPC
-speaks `https://`, so a PKCS#12 keystore must be present.
+speaks `https://`, so a PKCS#12 keystore must be present. Supply one, or have cert-manager issue it.
+
+**Bring your own keystore:**
 
 ```bash
 kubectl create secret generic kahuna-tls --from-file=certificate.pfx=/path/to/certificate.pfx
 ```
 
+```yaml
+spec:
+  tls:
+    secretRef: {name: kahuna-tls}
+    keystoreKey: certificate.pfx          # default
+    passwordSecretRef: {name: ..., key: ...}   # omit for an unprotected keystore
+```
+
+**Or let cert-manager issue it:**
+
+```yaml
+spec:
+  tls:
+    certManager:
+      issuerRef: {name: kahuna-selfsigned, kind: Issuer}
+```
+
+The operator creates a `Certificate` requesting a PKCS#12 keystore, generates a random password
+Secret for it (once — the password is baked into the issued keystore, so it is never rewritten),
+and points the server at cert-manager's fixed `keystore.p12` key. The per-pod SAN is a **wildcard**
+(`*.<name>-peer.<ns>.svc.cluster.local`) rather than one name per ordinal, so scaling the cluster
+does not reissue the certificate and restart every node that mounts it.
+
+The `KeystoreReady` condition reports whether the keystore exists yet; without it pods would sit
+stuck on a missing volume with no explanation.
+
 `spec.tls.insecureSkipVerify` defaults to `true`, which is what a self-signed in-cluster keystore
 needs. Set it to `false` when the issuer's CA is in the image's trust store.
+
+## Install
+
+```bash
+helm install kahuna-operator ./charts/kahuna-operator \
+  --namespace kahuna-system --create-namespace
+```
+
+See the [chart README](charts/kahuna-operator/README.md) — in particular the CRD upgrade caveat,
+since Helm never upgrades files under `crds/`.
 
 ## Development
 
 ```bash
 make test                                    # unit + envtest
+make test-e2e                                # kind e2e (creates and deletes its own cluster)
+make helm-lint                               # sync generated CRD/RBAC into the chart, then lint
 make docker-build IMG=kahuna-operator:dev
 kind load docker-image kahuna-operator:dev --name <cluster>
 make install                                 # CRDs
@@ -147,35 +189,34 @@ entrypoint with its own generated startup script.
 
 ## Known gaps
 
-- **Scale-down relies on failure detection rather than a clean leave.** Kahuna exposes
-  `--graceful-leave-on-shutdown` only as a startup flag, so a running node cannot be told to
-  decommission. The operator stops the pod and waits out SWIM's suspicion and eviction-grace
-  windows. Correct and safe, just slower and noisier than it should be. The clean fix is a
-  `POST /v1/cluster/leave` endpoint upstream calling `IRaft.LeaveCluster`.
 - **A node rejoining after a long absence can hit the Raft compaction floor.** If the cluster has
   discarded the log the node needs, catch-up cannot complete; seed it from a recent backup first.
   See the [cluster membership operations guide](https://github.com/kahunakv/kahuna/blob/main/docs/cluster-membership-operations-guide.md), §8.
 - **No metrics.** Kahuna emits no application metrics today, so there is no ServiceMonitor to ship.
-- **`nodeId` reads 0 for most roster members.** When the P0 leader seeds the initial roster from
-  static discovery it knows peers' endpoints but not their node ids, and records 0. Cosmetic — every
-  node agrees on the same record, and the operator matches members by endpoint.
+- **`nodeId` reads 0 for founding roster members.** Kommander seeds the initial roster from
+  discovery, which yields endpoints but not node ids, so peers are recorded with a provisional 0
+  that a later Join RPC would replace — and a founding node never sends one
+  (`RaftSystemCoordinator.cs:469`). This is intentional upstream and harmless: the roster keys on
+  endpoint, and so does this operator. It only shows up as a cosmetic 0 in
+  `kahuna.control --cluster-members` and `status.members[].nodeID`.
 
 ## Not yet implemented
 
-- cert-manager integration (`spec.tls.certManager` is defined in the API but not yet reconciled)
-- Helm chart and kustomize overlays
 - Backup/restore CRDs over the existing `/v1/backups/*` endpoints
-- Automated e2e suite in CI (the flows below have been verified by hand)
 
 ## Verified
 
-Against a 3-node cluster in kind, with `kahunakv/kahuna:dev` built from `Dockerfile.standalone`:
+`make test-e2e` runs all of the below against a real kind cluster — 8 specs, ~4m, using the
+published `kahunakv/kahuna` image. It is wired into CI on every push and pull request.
 
 - Bootstrap to 3 Voters in ~20s, producing exactly **one** StatefulSet revision — no spurious roll
 - Key/value round trip through the client Service
 - Scale 3 → 5: stepped one node at a time, existing pods untouched (identical UIDs and start times),
   both new nodes started with `--join-existing`
-- Scale 5 → 3: one at a time, each step waiting for the committed eviction
+- Scale 5 → 3: one at a time, each node decommissioned through `POST /v1/cluster/leave` before its
+  pod is removed
 - Rolling upgrade: one pod at a time, Voters held at 3 throughout, 0 restarts
 - Data written before the scale still readable after 3 → 5 → 3
 - `replicas: 2` and a `partitions` edit both rejected by the API server
+- cert-manager path: `Certificate` issued with a PKCS#12 keystore and a generated password, cluster
+  bootstrapped from it in under 40s with `KeystoreReady=True`

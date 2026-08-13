@@ -153,7 +153,7 @@ func staticArgs(cluster *kahunav1alpha1.KahunaCluster) []string {
 func keystoreKey(cluster *kahunav1alpha1.KahunaCluster) string {
 	if cluster.Spec.TLS.CertManager != nil {
 		// cert-manager writes its PKCS#12 output under this fixed key.
-		return "keystore.p12"
+		return certManagerKeystoreKey
 	}
 	if cluster.Spec.TLS.KeystoreKey != "" {
 		return cluster.Spec.TLS.KeystoreKey

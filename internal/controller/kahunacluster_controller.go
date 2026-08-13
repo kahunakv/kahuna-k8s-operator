@@ -69,6 +69,8 @@ type KahunaClusterReconciler struct {
 // +kubebuilder:rbac:groups="",resources=persistentvolumeclaims,verbs=get;list;watch;delete
 // +kubebuilder:rbac:groups="",resources=events,verbs=create;patch
 // +kubebuilder:rbac:groups=policy,resources=poddisruptionbudgets,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups="",resources=secrets,verbs=get;list;watch;create
+// +kubebuilder:rbac:groups=cert-manager.io,resources=certificates,verbs=get;list;watch;create;update;patch;delete
 
 // Reconcile drives a KahunaCluster toward its desired state.
 func (r *KahunaClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
@@ -91,6 +93,16 @@ func (r *KahunaClusterReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		}
 	}
 	bootstrapSize := cluster.Status.BootstrapSize
+
+	// TLS is provisioned before anything that mounts it. A StatefulSet whose keystore Secret does
+	// not exist yet schedules pods that sit stuck on the missing volume with no useful message,
+	// so the keystore is made ready first and its absence is reported as a condition.
+	if err := r.reconcileKeystorePassword(ctx, cluster); err != nil {
+		return ctrl.Result{}, fmt.Errorf("reconciling keystore password: %w", err)
+	}
+	if err := r.reconcileCertificate(ctx, cluster); err != nil {
+		return ctrl.Result{}, fmt.Errorf("reconciling certificate: %w", err)
+	}
 
 	if err := r.reconcileServices(ctx, cluster); err != nil {
 		return ctrl.Result{}, fmt.Errorf("reconciling services: %w", err)
@@ -116,7 +128,7 @@ func (r *KahunaClusterReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		log.V(1).Info("could not read cluster membership", "error", membershipErr)
 	}
 
-	sts, err := r.reconcileStatefulSet(ctx, cluster, bootstrapped, membership)
+	sts, err := r.reconcileStatefulSet(ctx, cluster, bootstrapped, membership, pods)
 	if err != nil {
 		return ctrl.Result{}, fmt.Errorf("reconciling stateful set: %w", err)
 	}
@@ -186,7 +198,7 @@ func (r *KahunaClusterReconciler) reconcilePDB(ctx context.Context, cluster *kah
 
 // reconcileStatefulSet creates or updates the StatefulSet, applying the size and rolling-update
 // partition that buildPlan considers safe right now.
-func (r *KahunaClusterReconciler) reconcileStatefulSet(ctx context.Context, cluster *kahunav1alpha1.KahunaCluster, bootstrapped bool, membership *kahuna.Membership) (*appsv1.StatefulSet, error) {
+func (r *KahunaClusterReconciler) reconcileStatefulSet(ctx context.Context, cluster *kahunav1alpha1.KahunaCluster, bootstrapped bool, membership *kahuna.Membership, pods []corev1.Pod) (*appsv1.StatefulSet, error) {
 	// bootstrapped decides whether a scale step may be taken at all, not what the pods look like.
 	existing := &appsv1.StatefulSet{}
 	err := r.Get(ctx, types.NamespacedName{Name: stsName(cluster), Namespace: cluster.Namespace}, existing)
@@ -211,6 +223,22 @@ func (r *KahunaClusterReconciler) reconcileStatefulSet(ctx context.Context, clus
 		currentReplicas = *existing.Spec.Replicas
 	}
 	p := buildPlan(cluster, currentReplicas, bootstrapped, membership)
+
+	// Shrinking means removing a member, and a member leaves the roster properly by asking. Doing
+	// it here rather than deleting the pod and waiting for the cluster to notice keeps a planned
+	// removal from being indistinguishable from a crash — and turns the wait from the failure
+	// detector's suspicion plus eviction-grace windows into one consensus round.
+	if p.Replicas < currentReplicas {
+		ordinal := currentReplicas - 1
+		left, reason := r.decommission(ctx, cluster, pods, ordinal)
+		if !left {
+			// The node is still a member. Removing its pod now would drop the cluster into the
+			// slow path it was just asked to avoid, so hold at the current size.
+			p.Replicas = currentReplicas
+			p.Partition = currentReplicas
+			p.Reason = reason
+		}
+	}
 
 	desired := desiredStatefulSet(cluster, p.Partition)
 	desired.Spec.Replicas = &p.Replicas
@@ -294,6 +322,10 @@ func (r *KahunaClusterReconciler) reconcileStatus(ctx context.Context, cluster *
 		status.Phase = kahunav1alpha1.PhaseRunning
 	}
 
+	keystoreReady, keystoreMsg := r.certificateReady(ctx, cluster)
+	setCondition(status, conditionKeystoreReady, keystoreReady,
+		"KeystoreAvailable", "KeystorePending", keystoreOrDefault(keystoreMsg))
+
 	setCondition(status, kahunav1alpha1.ConditionProgressing, progressing,
 		"Converging", "Converged",
 		fmt.Sprintf("%d/%d nodes ready, %d voters", status.ReadyReplicas, desired, status.Voters))
@@ -317,6 +349,14 @@ func (r *KahunaClusterReconciler) reconcileStatus(ctx context.Context, cluster *
 		return ctrl.Result{RequeueAfter: requeueProgressing}, nil
 	}
 	return ctrl.Result{RequeueAfter: requeueSteady}, nil
+}
+
+// keystoreOrDefault supplies a message for the ready case, where there is nothing to explain.
+func keystoreOrDefault(msg string) string {
+	if msg == "" {
+		return "PKCS#12 keystore is present"
+	}
+	return msg
 }
 
 // rosterMessage explains the RosterConverged condition.

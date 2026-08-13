@@ -12,6 +12,10 @@ jobs:
       contents: read
     name: Run on Ubuntu
     runs-on: ubuntu-latest
+    # The suite walks a real cluster through bootstrap, a scale out and back, and a rolling
+    # restart. Each membership change waits out SWIM's suspicion and eviction-grace windows, so
+    # the wall-clock floor is minutes and no tuning removes it.
+    timeout-minutes: 45
     steps:
       - name: Clone the code
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -36,3 +40,17 @@ jobs:
         run: |
           go mod tidy
           make test-e2e
+
+      # The suite tears its namespace down on success, so this only ever runs against a cluster
+      # that is still in whatever state broke it.
+      - name: Dump cluster state on failure
+        if: failure()
+        run: |
+          kubectl get kahunaclusters -A -o yaml || true
+          kubectl -n kahuna-e2e get pods,sts,svc,cm,pvc || true
+          kubectl -n kahuna-e2e describe pods || true
+          for p in $(kubectl -n kahuna-e2e get pods -o name 2>/dev/null); do
+            echo "===== $p ====="
+            kubectl -n kahuna-e2e logs "$p" --tail=200 || true
+          done
+          kubectl -n kahuna-operator-system logs deployment/kahuna-operator-controller-manager --tail=300 || true

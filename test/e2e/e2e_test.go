@@ -20,11 +20,12 @@ limitations under the License.
 package e2e
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
-	"os"
+	"net/http"
 	"os/exec"
-	"path/filepath"
+	"strings"
 	"time"
 
 	. "github.com/onsi/ginkgo/v2"
@@ -33,307 +34,352 @@ import (
 	"github.com/kahunakv/k8s-operator/test/utils"
 )
 
-// namespace where the project is deployed in
-const namespace = "kahuna-operator-system"
+const (
+	operatorNamespace = "kahuna-operator-system"
+	testNamespace     = "kahuna-e2e"
+	clusterName       = "kahuna"
 
-// serviceAccountName created for the project
-const serviceAccountName = "kahuna-operator-controller-manager"
+	// Scale steps are one consensus round plus the operator's requeue interval now that nodes are
+	// asked to leave rather than evicted by the failure detector. The allowance stays generous so
+	// a slow CI runner does not turn a timing difference into a failure.
+	membershipTimeout = 5 * time.Minute
+	bootstrapTimeout  = 4 * time.Minute
+	pollInterval      = 5 * time.Second
+)
 
-// metricsServiceName is the name of the metrics service of the project
-const metricsServiceName = "kahuna-operator-controller-manager-metrics-service"
+// kubectl runs a kubectl command and returns its trimmed stdout.
+func kubectl(args ...string) (string, error) {
+	out, err := utils.Run(exec.Command("kubectl", args...))
+	return strings.TrimSpace(out), err
+}
 
-// metricsRoleBindingName is the name of the RBAC that will be created to allow get the metrics data
-const metricsRoleBindingName = "kahuna-operator-metrics-binding"
+// mustKubectl runs a kubectl command and fails the spec if it errors.
+func mustKubectl(args ...string) string {
+	out, err := kubectl(args...)
+	ExpectWithOffset(1, err).NotTo(HaveOccurred(), "kubectl %s: %s", strings.Join(args, " "), out)
+	return out
+}
 
-var _ = Describe("Manager", Ordered, func() {
-	var controllerPodName string
+// applyYAML pipes a manifest into kubectl apply.
+func applyYAML(manifest string) {
+	cmd := exec.Command("kubectl", "apply", "-f", "-")
+	cmd.Stdin = strings.NewReader(manifest)
+	out, err := utils.Run(cmd)
+	ExpectWithOffset(1, err).NotTo(HaveOccurred(), "applying manifest: %s", out)
+}
 
-	// Before running the tests, set up the environment by creating the namespace,
-	// enforce the restricted security policy to the namespace, installing CRDs,
-	// and deploying the controller.
+// clusterField reads a jsonpath expression off the KahunaCluster.
+func clusterField(path string) string {
+	out, err := kubectl("-n", testNamespace, "get", "kahunacluster", clusterName,
+		"-o", "jsonpath="+path)
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(out)
+}
+
+// podUIDs maps pod name to UID, which is how a restart is detected: a restarted pod keeps its
+// name but gets a new UID.
+func podUIDs() map[string]string {
+	out, err := kubectl("-n", testNamespace, "get", "pods",
+		"-l", "app.kubernetes.io/instance="+clusterName,
+		"-o", `jsonpath={range .items[*]}{.metadata.name}={.metadata.uid} {end}`)
+	uids := map[string]string{}
+	if err != nil {
+		return uids
+	}
+	for _, kv := range strings.Fields(out) {
+		if name, uid, ok := strings.Cut(kv, "="); ok {
+			uids[name] = uid
+		}
+	}
+	return uids
+}
+
+// withPortForward opens a port-forward to the client Service and runs fn against it. Pod and
+// Service IPs inside Kind are not routable from the test process, so this is how the suite talks
+// to the cluster it just built.
+func withPortForward(fn func(baseURL string)) {
+	const localPort = 32070
+	cmd := exec.Command("kubectl", "-n", testNamespace, "port-forward",
+		"svc/"+clusterName, fmt.Sprintf("%d:2070", localPort))
+	ExpectWithOffset(1, cmd.Start()).To(Succeed())
+	defer func() {
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
+	}()
+
+	baseURL := fmt.Sprintf("http://localhost:%d", localPort)
+	// The forward takes a moment to bind; poll rather than sleep a fixed amount.
+	EventuallyWithOffset(1, func() error {
+		resp, err := http.Get(baseURL + "/")
+		if err != nil {
+			return err
+		}
+		defer func() { _ = resp.Body.Close() }()
+		return nil
+	}, 60*time.Second, time.Second).Should(Succeed(), "port-forward never became usable")
+
+	fn(baseURL)
+}
+
+// kvSet writes a key. Durability 1 is Persistent.
+func kvSet(baseURL, key, value string) {
+	body := map[string]any{
+		"key":        key,
+		"value":      base64.StdEncoding.EncodeToString([]byte(value)),
+		"durability": 1,
+	}
+	raw, _ := json.Marshal(body)
+	resp, err := http.Post(baseURL+"/v1/kv/try-set", "application/json", strings.NewReader(string(raw)))
+	ExpectWithOffset(1, err).NotTo(HaveOccurred())
+	defer func() { _ = resp.Body.Close() }()
+
+	var out struct {
+		Type int `json:"type"`
+	}
+	ExpectWithOffset(1, json.NewDecoder(resp.Body).Decode(&out)).To(Succeed())
+	// 0 is KeyValueResponseType.Set.
+	ExpectWithOffset(1, out.Type).To(Equal(0), "set did not succeed")
+}
+
+// kvGet reads a key back.
+func kvGet(baseURL, key string) string {
+	body := map[string]any{"key": key, "revision": -1, "durability": 1}
+	raw, _ := json.Marshal(body)
+	resp, err := http.Post(baseURL+"/v1/kv/try-get", "application/json", strings.NewReader(string(raw)))
+	ExpectWithOffset(1, err).NotTo(HaveOccurred())
+	defer func() { _ = resp.Body.Close() }()
+
+	var out struct {
+		Type  int    `json:"type"`
+		Value string `json:"value"`
+	}
+	ExpectWithOffset(1, json.NewDecoder(resp.Body).Decode(&out)).To(Succeed())
+	ExpectWithOffset(1, out.Type).To(Equal(3), "get did not return a value (type %d)", out.Type)
+
+	decoded, err := base64.StdEncoding.DecodeString(out.Value)
+	ExpectWithOffset(1, err).NotTo(HaveOccurred())
+	return string(decoded)
+}
+
+// clusterManifest renders a KahunaCluster at the given size.
+func clusterManifest(replicas int, extraArgs string) string {
+	return fmt.Sprintf(`
+apiVersion: kahuna.kahunakv.io/v1alpha1
+kind: KahunaCluster
+metadata:
+  name: %s
+  namespace: %s
+spec:
+  replicas: %d
+  image: %s
+  imagePullPolicy: IfNotPresent
+  partitions: 3
+  storage:
+    backend: rocksdb
+    data:
+      size: 1Gi
+  tls:
+    certManager:
+      issuerRef:
+        name: kahuna-selfsigned
+        kind: Issuer
+    insecureSkipVerify: true
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+%s
+`, clusterName, testNamespace, replicas, kahunaImage, extraArgs)
+}
+
+// expectConverged waits for the operator to report a converged cluster of the given size.
+func expectConverged(replicas int) {
+	EventuallyWithOffset(1, func() string {
+		return fmt.Sprintf("%s/%s/%s",
+			clusterField("{.status.voters}"),
+			clusterField("{.status.readyReplicas}"),
+			clusterField("{.status.phase}"))
+	}, membershipTimeout, pollInterval).Should(
+		Equal(fmt.Sprintf("%d/%d/Running", replicas, replicas)),
+		"cluster never converged at %d nodes", replicas)
+}
+
+var _ = Describe("KahunaCluster", Ordered, func() {
 	BeforeAll(func() {
-		By("creating manager namespace")
-		cmd := exec.Command("kubectl", "create", "ns", namespace)
-		_, err := utils.Run(cmd)
-		Expect(err).NotTo(HaveOccurred(), "Failed to create namespace")
+		By("deploying the operator")
+		mustKubectl("create", "namespace", operatorNamespace, "--dry-run=client", "-o", "yaml")
+		_, err := utils.Run(exec.Command("make", "install"))
+		Expect(err).NotTo(HaveOccurred(), "failed to install CRDs")
+		_, err = utils.Run(exec.Command("make", "deploy", "IMG="+managerImage))
+		Expect(err).NotTo(HaveOccurred(), "failed to deploy the operator")
 
-		By("labeling the namespace to enforce the restricted security policy")
-		cmd = exec.Command("kubectl", "label", "--overwrite", "ns", namespace,
-			"pod-security.kubernetes.io/enforce=restricted")
-		_, err = utils.Run(cmd)
-		Expect(err).NotTo(HaveOccurred(), "Failed to label namespace with restricted policy")
+		// The image tag is fixed, so a rebuilt image leaves the Deployment spec byte-identical and
+		// Kubernetes has no reason to restart anything — on a reused cluster that silently tests
+		// the *previous* build. Forcing a rollout makes "the operator under test" mean the binary
+		// this run just built.
+		By("restarting the operator so the freshly built image is the one running")
+		mustKubectl("-n", operatorNamespace, "rollout", "restart",
+			"deployment/kahuna-operator-controller-manager")
+		mustKubectl("-n", operatorNamespace, "rollout", "status",
+			"deployment/kahuna-operator-controller-manager", "--timeout=5m")
 
-		By("installing CRDs")
-		cmd = exec.Command("make", "install")
-		_, err = utils.Run(cmd)
-		Expect(err).NotTo(HaveOccurred(), "Failed to install CRDs")
+		Eventually(func() string {
+			return clusterFieldIn(operatorNamespace, "deployment", "kahuna-operator-controller-manager",
+				"{.status.readyReplicas}")
+		}, 3*time.Minute, pollInterval).Should(Equal("1"), "operator never became ready")
 
-		By("deploying the controller-manager")
-		cmd = exec.Command("make", "deploy", fmt.Sprintf("IMG=%s", managerImage))
-		_, err = utils.Run(cmd)
-		Expect(err).NotTo(HaveOccurred(), "Failed to deploy the controller-manager")
+		By("creating the test namespace and a self-signed issuer")
+		applyYAML(fmt.Sprintf("apiVersion: v1\nkind: Namespace\nmetadata:\n  name: %s\n", testNamespace))
+		applyYAML(fmt.Sprintf(`
+apiVersion: cert-manager.io/v1
+kind: Issuer
+metadata:
+  name: kahuna-selfsigned
+  namespace: %s
+spec:
+  selfSigned: {}
+`, testNamespace))
 	})
 
-	// After all tests have been executed, clean up by undeploying the controller, uninstalling CRDs,
-	// and deleting the namespace.
 	AfterAll(func() {
-		By("cleaning up the curl pod for metrics")
-		cmd := exec.Command("kubectl", "delete", "pod", "curl-metrics", "-n", namespace)
-		_, _ = utils.Run(cmd)
-
-		By("undeploying the controller-manager")
-		cmd = exec.Command("make", "undeploy")
-		_, _ = utils.Run(cmd)
-
-		By("uninstalling CRDs")
-		cmd = exec.Command("make", "uninstall")
-		_, _ = utils.Run(cmd)
-
-		By("removing manager namespace")
-		cmd = exec.Command("kubectl", "delete", "ns", namespace)
-		_, _ = utils.Run(cmd)
+		By("removing the test namespace")
+		_, _ = kubectl("delete", "namespace", testNamespace, "--wait=false")
 	})
 
-	// After each test, check for failures and collect logs, events,
-	// and pod descriptions for debugging.
-	AfterEach(func() {
-		specReport := CurrentSpecReport()
-		if specReport.Failed() {
-			By("Fetching controller manager pod logs")
-			cmd := exec.Command("kubectl", "logs", controllerPodName, "-n", namespace)
-			controllerLogs, err := utils.Run(cmd)
-			if err == nil {
-				_, _ = fmt.Fprintf(GinkgoWriter, "Controller logs:\n %s", controllerLogs)
-			} else {
-				_, _ = fmt.Fprintf(GinkgoWriter, "Failed to get Controller logs: %s", err)
-			}
+	It("rejects configurations that cannot work", func() {
+		By("refusing a two-node cluster")
+		cmd := exec.Command("kubectl", "apply", "-f", "-")
+		cmd.Stdin = strings.NewReader(clusterManifest(2, ""))
+		out, err := utils.Run(cmd)
+		Expect(err).To(HaveOccurred(), "a 2-replica cluster was accepted: %s", out)
+		Expect(out).To(ContainSubstring("must not be 2"))
+	})
 
-			By("Fetching Kubernetes events")
-			cmd = exec.Command("kubectl", "get", "events", "-n", namespace, "--sort-by=.lastTimestamp")
-			eventsOutput, err := utils.Run(cmd)
-			if err == nil {
-				_, _ = fmt.Fprintf(GinkgoWriter, "Kubernetes events:\n%s", eventsOutput)
-			} else {
-				_, _ = fmt.Fprintf(GinkgoWriter, "Failed to get Kubernetes events: %s", err)
-			}
+	It("bootstraps a three node cluster without an extra rollout", func() {
+		applyYAML(clusterManifest(3, ""))
 
-			By("Fetching curl-metrics logs")
-			cmd = exec.Command("kubectl", "logs", "curl-metrics", "-n", namespace)
-			metricsOutput, err := utils.Run(cmd)
-			if err == nil {
-				_, _ = fmt.Fprintf(GinkgoWriter, "Metrics logs:\n %s", metricsOutput)
-			} else {
-				_, _ = fmt.Fprintf(GinkgoWriter, "Failed to get curl-metrics logs: %s", err)
-			}
+		Eventually(func() string {
+			return clusterField("{.status.phase}")
+		}, bootstrapTimeout, pollInterval).ShouldNot(BeEmpty(), "operator never reconciled the cluster")
 
-			By("Fetching controller manager pod description")
-			cmd = exec.Command("kubectl", "describe", "pod", controllerPodName, "-n", namespace)
-			podDescription, err := utils.Run(cmd)
-			if err == nil {
-				fmt.Println("Pod description:\n", podDescription)
-			} else {
-				fmt.Println("Failed to describe controller pod")
-			}
+		expectConverged(3)
+
+		By("checking the keystore came from cert-manager")
+		Expect(mustKubectl("-n", testNamespace, "get", "certificate", clusterName+"-tls",
+			"-o", "jsonpath={.status.conditions[?(@.type=='Ready')].status}")).To(Equal("True"))
+
+		// A second revision here would mean the cluster rolled itself immediately after
+		// bootstrapping — the failure mode that moving topology out of the pod template fixed.
+		By("checking the StatefulSet has exactly one revision")
+		revs := mustKubectl("-n", testNamespace, "get", "controllerrevision",
+			"-o", "jsonpath={.items[*].metadata.name}")
+		Expect(strings.Fields(revs)).To(HaveLen(1), "the cluster rolled itself after bootstrap")
+	})
+
+	It("serves reads and writes through the client service", func() {
+		withPortForward(func(baseURL string) {
+			kvSet(baseURL, "e2e/key", "before-scale")
+			Expect(kvGet(baseURL, "e2e/key")).To(Equal("before-scale"))
+		})
+	})
+
+	It("rejects edits to fields that are fixed at bootstrap", func() {
+		out, err := kubectl("-n", testNamespace, "patch", "kahunacluster", clusterName,
+			"--type=merge", "-p", `{"spec":{"partitions":5}}`)
+		Expect(err).To(HaveOccurred(), "partitions was mutable: %s", out)
+		Expect(out).To(ContainSubstring("immutable"))
+	})
+
+	It("scales up one node at a time without disturbing the existing ones", func() {
+		before := podUIDs()
+		Expect(before).To(HaveLen(3))
+
+		mustKubectl("-n", testNamespace, "patch", "kahunacluster", clusterName,
+			"--type=merge", "-p", `{"spec":{"replicas":5}}`)
+
+		expectConverged(5)
+
+		By("checking the founding nodes were never restarted")
+		after := podUIDs()
+		for name, uid := range before {
+			Expect(after).To(HaveKeyWithValue(name, uid),
+				"%s was restarted by the scale-up", name)
+		}
+
+		By("checking the new nodes joined rather than formed a cluster")
+		for _, pod := range []string{clusterName + "-3", clusterName + "-4"} {
+			logs, err := kubectl("-n", testNamespace, "logs", pod)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(logs).To(ContainSubstring("--join-existing"),
+				"%s did not join the running cluster", pod)
 		}
 	})
 
-	SetDefaultEventuallyTimeout(2 * time.Minute)
-	SetDefaultEventuallyPollingInterval(time.Second)
+	It("scales down one node at a time, decommissioning each before removing it", func() {
+		mustKubectl("-n", testNamespace, "patch", "kahunacluster", clusterName,
+			"--type=merge", "-p", `{"spec":{"replicas":3}}`)
 
-	Context("Manager", func() {
-		It("should run successfully", func() {
-			By("validating that the controller-manager pod is running as expected")
-			verifyControllerUp := func(g Gomega) {
-				By("getting the name of the controller-manager pod")
-				cmd := exec.Command("kubectl", "get",
-					"pods", "-l", "control-plane=controller-manager",
-					"-o", "go-template={{ range .items }}"+
-						"{{ if not .metadata.deletionTimestamp }}"+
-						"{{ .metadata.name }}"+
-						"{{ \"\\n\" }}{{ end }}{{ end }}",
-					"-n", namespace,
-				)
+		expectConverged(3)
 
-				podOutput, err := utils.Run(cmd)
-				g.Expect(err).NotTo(HaveOccurred(), "Failed to retrieve controller-manager pod information")
-				podNames := utils.GetNonEmptyLines(podOutput)
-				g.Expect(podNames).To(HaveLen(1), "expected 1 controller pod running")
-				controllerPodName = podNames[0]
-				g.Expect(controllerPodName).To(ContainSubstring("controller-manager"))
+		// A node that was asked to leave is out of the roster before its pod goes away, so the
+		// operator never has to wait for the cluster to notice a member is missing.
+		By("checking the operator asked nodes to leave rather than letting them be evicted")
+		logs, err := kubectl("-n", operatorNamespace, "logs",
+			"deployment/kahuna-operator-controller-manager", "--tail=2000")
+		Expect(err).NotTo(HaveOccurred())
+		Expect(logs).To(ContainSubstring("node left the cluster"))
+		Expect(logs).NotTo(ContainSubstring("falling back to eviction"))
 
-				By("validating the pod's status")
-				cmd = exec.Command("kubectl", "get",
-					"pods", controllerPodName, "-o", "jsonpath={.status.phase}",
-					"-n", namespace,
-				)
-				output, err := utils.Run(cmd)
-				g.Expect(err).NotTo(HaveOccurred())
-				g.Expect(output).To(Equal("Running"), "Incorrect controller-manager pod status")
-			}
-			Eventually(verifyControllerUp).Should(Succeed())
+		Eventually(func() string {
+			return clusterField("{.status.replicas}")
+		}, membershipTimeout, pollInterval).Should(Equal("3"))
+	})
+
+	It("still serves the data written before the scale", func() {
+		withPortForward(func(baseURL string) {
+			Expect(kvGet(baseURL, "e2e/key")).To(Equal("before-scale"))
 		})
+	})
 
-		It("should ensure the metrics endpoint is serving metrics", func() {
-			By("creating a ClusterRoleBinding for the service account to allow access to metrics")
-			cmd := exec.Command("kubectl", "create", "clusterrolebinding", metricsRoleBindingName,
-				"--clusterrole=kahuna-operator-metrics-reader",
-				fmt.Sprintf("--serviceaccount=%s:%s", namespace, serviceAccountName),
-			)
-			_, err := utils.Run(cmd)
-			Expect(err).NotTo(HaveOccurred(), "Failed to create ClusterRoleBinding")
+	It("rolls the cluster when configuration changes, holding quorum throughout", func() {
+		before := podUIDs()
 
-			By("validating that the metrics service is available")
-			cmd = exec.Command("kubectl", "get", "service", metricsServiceName, "-n", namespace)
-			_, err = utils.Run(cmd)
-			Expect(err).NotTo(HaveOccurred(), "Metrics service should exist")
+		mustKubectl("-n", testNamespace, "patch", "kahunacluster", clusterName,
+			"--type=merge", "-p", `{"spec":{"logLevel":"Debug"}}`)
 
-			By("getting the service account token")
-			token, err := serviceAccountToken()
-			Expect(err).NotTo(HaveOccurred())
-			Expect(token).NotTo(BeEmpty())
-
-			By("ensuring the controller pod is ready")
-			verifyControllerPodReady := func(g Gomega) {
-				cmd := exec.Command("kubectl", "get", "pod", controllerPodName, "-n", namespace,
-					"-o", "jsonpath={.status.conditions[?(@.type=='Ready')].status}")
-				output, err := utils.Run(cmd)
-				g.Expect(err).NotTo(HaveOccurred())
-				g.Expect(output).To(Equal("True"), "Controller pod not ready")
+		// The roll is observable as every pod getting a new UID.
+		Eventually(func() bool {
+			after := podUIDs()
+			if len(after) != len(before) {
+				return false
 			}
-			Eventually(verifyControllerPodReady, 3*time.Minute, time.Second).Should(Succeed())
-
-			By("verifying that the controller manager is serving the metrics server")
-			verifyMetricsServerStarted := func(g Gomega) {
-				cmd := exec.Command("kubectl", "logs", controllerPodName, "-n", namespace)
-				output, err := utils.Run(cmd)
-				g.Expect(err).NotTo(HaveOccurred())
-				g.Expect(output).To(ContainSubstring("Serving metrics server"),
-					"Metrics server not yet started")
+			for name, uid := range before {
+				if after[name] == uid {
+					return false
+				}
 			}
-			Eventually(verifyMetricsServerStarted, 3*time.Minute, time.Second).Should(Succeed())
+			return true
+		}, membershipTimeout, pollInterval).Should(BeTrue(), "the cluster never rolled")
 
-			// +kubebuilder:scaffold:e2e-metrics-webhooks-readiness
+		expectConverged(3)
 
-			By("creating the curl-metrics pod to access the metrics endpoint")
-			cmd = exec.Command("kubectl", "run", "curl-metrics", "--restart=Never",
-				"--namespace", namespace,
-				"--image=curlimages/curl:latest",
-				"--overrides",
-				fmt.Sprintf(`{
-					"spec": {
-						"containers": [{
-							"name": "curl",
-							"image": "curlimages/curl:latest",
-							"command": ["/bin/sh", "-c"],
-							"args": [
-								"for i in $(seq 1 30); do curl -v -k -H 'Authorization: Bearer %s' https://%s.%s.svc.cluster.local:8443/metrics && exit 0 || sleep 2; done; exit 1"
-							],
-							"securityContext": {
-								"readOnlyRootFilesystem": true,
-								"allowPrivilegeEscalation": false,
-								"capabilities": {
-									"drop": ["ALL"]
-								},
-								"runAsNonRoot": true,
-								"runAsUser": 1000,
-								"seccompProfile": {
-									"type": "RuntimeDefault"
-								}
-							}
-						}],
-						"serviceAccountName": "%s"
-					}
-				}`, token, metricsServiceName, namespace, serviceAccountName))
-			_, err = utils.Run(cmd)
-			Expect(err).NotTo(HaveOccurred(), "Failed to create curl-metrics pod")
-
-			By("waiting for the curl-metrics pod to complete.")
-			verifyCurlUp := func(g Gomega) {
-				cmd := exec.Command("kubectl", "get", "pods", "curl-metrics",
-					"-o", "jsonpath={.status.phase}",
-					"-n", namespace)
-				output, err := utils.Run(cmd)
-				g.Expect(err).NotTo(HaveOccurred())
-				g.Expect(output).To(Equal("Succeeded"), "curl pod in wrong status")
-			}
-			Eventually(verifyCurlUp, 5*time.Minute).Should(Succeed())
-
-			By("getting the metrics by checking curl-metrics logs")
-			verifyMetricsAvailable := func(g Gomega) {
-				metricsOutput, err := getMetricsOutput()
-				g.Expect(err).NotTo(HaveOccurred(), "Failed to retrieve logs from curl pod")
-				g.Expect(metricsOutput).NotTo(BeEmpty())
-				g.Expect(metricsOutput).To(ContainSubstring("< HTTP/1.1 200 OK"))
-			}
-			Eventually(verifyMetricsAvailable, 2*time.Minute).Should(Succeed())
-		})
-
-		// +kubebuilder:scaffold:e2e-webhooks-checks
-
-		// TODO: Customize the e2e test suite with scenarios specific to your project.
-		// Consider applying sample/CR(s) and check their status and/or verifying
-		// the reconciliation by using the metrics, i.e.:
-		// metricsOutput, err := getMetricsOutput()
-		// Expect(err).NotTo(HaveOccurred(), "Failed to retrieve logs from curl pod")
-		// Expect(metricsOutput).To(ContainSubstring(
-		//    fmt.Sprintf(`controller_runtime_reconcile_total{controller="%s",result="success"} 1`,
-		//    strings.ToLower(<Kind>),
-		// ))
+		By("checking no node crash-looped through the roll")
+		restarts := mustKubectl("-n", testNamespace, "get", "pods",
+			"-l", "app.kubernetes.io/instance="+clusterName,
+			"-o", "jsonpath={.items[*].status.containerStatuses[0].restartCount}")
+		for _, r := range strings.Fields(restarts) {
+			Expect(r).To(Equal("0"), "a node restarted during the rolling update")
+		}
 	})
 })
 
-// serviceAccountToken returns a token for the specified service account in the given namespace.
-// It uses the Kubernetes TokenRequest API to generate a token by directly sending a request
-// and parsing the resulting token from the API response.
-func serviceAccountToken() (string, error) {
-	const tokenRequestRawString = `{
-		"apiVersion": "authentication.k8s.io/v1",
-		"kind": "TokenRequest"
-	}`
-
-	By("creating temporary file to store the token request")
-	secretName := fmt.Sprintf("%s-token-request", serviceAccountName)
-	tokenRequestFile := filepath.Join("/tmp", secretName)
-	err := os.WriteFile(tokenRequestFile, []byte(tokenRequestRawString), os.FileMode(0o644))
+// clusterFieldIn reads a jsonpath expression off an arbitrary resource.
+func clusterFieldIn(namespace, kind, name, path string) string {
+	out, err := kubectl("-n", namespace, "get", kind, name, "-o", "jsonpath="+path)
 	if err != nil {
-		return "", err
+		return ""
 	}
-
-	var out string
-	verifyTokenCreation := func(g Gomega) {
-		By("executing kubectl command to create the token")
-		cmd := exec.Command("kubectl", "create", "--raw", fmt.Sprintf(
-			"/api/v1/namespaces/%s/serviceaccounts/%s/token",
-			namespace,
-			serviceAccountName,
-		), "-f", tokenRequestFile)
-
-		output, err := cmd.CombinedOutput()
-		g.Expect(err).NotTo(HaveOccurred())
-
-		By("parsing the JSON output to extract the token")
-		var token tokenRequest
-		err = json.Unmarshal(output, &token)
-		g.Expect(err).NotTo(HaveOccurred())
-
-		out = token.Status.Token
-	}
-	Eventually(verifyTokenCreation).Should(Succeed())
-
-	return out, err
-}
-
-// getMetricsOutput retrieves and returns the logs from the curl pod used to access the metrics endpoint.
-func getMetricsOutput() (string, error) {
-	By("getting the curl-metrics logs")
-	cmd := exec.Command("kubectl", "logs", "curl-metrics", "-n", namespace)
-	return utils.Run(cmd)
-}
-
-// tokenRequest is a simplified representation of the Kubernetes TokenRequest API response,
-// containing only the token field that we need to extract.
-type tokenRequest struct {
-	Status struct {
-		Token string `json:"token"`
-	} `json:"status"`
+	return strings.TrimSpace(out)
 }

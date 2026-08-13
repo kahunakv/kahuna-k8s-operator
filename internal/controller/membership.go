@@ -24,6 +24,7 @@ import (
 	"strings"
 
 	corev1 "k8s.io/api/core/v1"
+	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	kahunav1alpha1 "github.com/kahunakv/k8s-operator/api/v1alpha1"
 	"github.com/kahunakv/k8s-operator/internal/kahuna"
@@ -148,4 +149,47 @@ func countRoles(members []kahunav1alpha1.MemberStatus) (voters, learners int32) 
 		}
 	}
 	return voters, learners
+}
+
+// decommission asks the node at the given ordinal to remove itself from the committed roster, and
+// reports whether it is safe to take the pod away.
+//
+// Returning false is not a failure — it means "not yet". The caller holds the cluster at its
+// current size and tries again, because deleting a pod that is still a committed member is exactly
+// the situation the leave API exists to avoid.
+func (r *KahunaClusterReconciler) decommission(ctx context.Context, cluster *kahunav1alpha1.KahunaCluster, pods []corev1.Pod, ordinal int32) (bool, string) {
+	log := logf.FromContext(ctx)
+	name := podName(cluster, ordinal)
+
+	var pod *corev1.Pod
+	for i := range pods {
+		if pods[i].Name == name && pods[i].Status.PodIP != "" {
+			pod = &pods[i]
+			break
+		}
+	}
+	if pod == nil {
+		// No pod to ask. It is already gone, so the cluster will evict it through the failure
+		// detector — slower, but not wrong, and there is nothing better available.
+		log.Info("node has no reachable pod to decommission; falling back to eviction", "pod", name)
+		return true, ""
+	}
+
+	result, err := r.Kahuna.Leave(ctx, podBaseURL(cluster, pod))
+	if err != nil {
+		return false, fmt.Sprintf("could not ask %s to leave the cluster: %v", name, err)
+	}
+
+	if result.Removed() {
+		log.Info("node left the cluster", "pod", name,
+			"outcome", result.Outcome, "membershipVersion", result.MembershipVersion)
+		return true, ""
+	}
+
+	// A permanent refusal will not pass on its own. Surfacing the server's own reason is more
+	// useful than restating it: it names the remedy.
+	if !result.Retryable {
+		return false, fmt.Sprintf("%s refused to leave: %s", name, result.Reason)
+	}
+	return false, fmt.Sprintf("waiting for %s to leave the cluster: %s", name, result.Reason)
 }
