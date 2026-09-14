@@ -69,6 +69,14 @@ func staticArgs(cluster *kahunav1alpha1.KahunaCluster) []string {
 		// The Raft port must be one of the HTTPS ports: inter-node gRPC rides the TLS listener.
 		"--https-ports", fmt.Sprintf("%d", p.HTTPS), fmt.Sprintf("%d", p.Raft),
 		"--https-certificate", tlsMountPath + "/" + keystoreKey(cluster),
+		// Required, not optional. Since Kahuna 1.8.x a configured --https-certificate suppresses
+		// every cleartext listener unless this flag is given, and the operator always configures
+		// one. Without it --http-ports above binds nothing, which takes out all three plaintext
+		// consumers at once: the liveness probe, the readiness probe and the operator's own
+		// membership and leave calls. The cluster would then never leave bootstrap, and the
+		// kubelet would restart every pod on a loop. Kahuna's own single-node entrypoint passes
+		// the same flag for the same reason.
+		"--allow-plaintext-listener",
 	}
 
 	backend := string(s.Backend)

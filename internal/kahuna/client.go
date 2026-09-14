@@ -134,18 +134,50 @@ type Client interface {
 	Leave(ctx context.Context, baseURL string) (*LeaveResult, error)
 }
 
+// Default timeouts. A status read and a leave need different bounds, and one value cannot serve
+// both.
+//
+// DefaultLeaveTimeout covers the Kahuna server's own bound on a graceful leave: it holds the
+// request open while it evacuates the departing node's replicas, for up to
+// --raft-decommission-drain-timeout (120s by default) plus its 30s guard margin. The server links
+// that work to the request, so a client that gives up first cancels the drain rather than merely
+// stopping the wait. Under the default full replication no range names the node, so nothing is
+// evacuated and the call returns at once; the long bound only matters where
+// --raft-replication-factor is set.
+const (
+	DefaultReadTimeout  = 5 * time.Second
+	DefaultLeaveTimeout = 150 * time.Second
+)
+
 // HTTPClient talks to the plaintext client port. The operator deliberately uses HTTP rather than
 // the TLS port: the cluster's keystore is typically self-signed and scoped to in-cluster peer
 // names, so requiring the operator to trust it would add a failure mode for a read-only status
 // query that never leaves the cluster network.
 type HTTPClient struct {
 	HTTP *http.Client
+	// ReadTimeout bounds Membership and Health. It stays short: a status read must never wedge a
+	// reconcile, and an unreachable node is reported as an unknown roster rather than an error.
+	ReadTimeout time.Duration
+	// LeaveTimeout bounds Leave, which is not a status read and must not carry a read bound.
+	LeaveTimeout time.Duration
 }
 
-// NewHTTPClient returns a client with a bounded timeout. Status reads must never wedge a
-// reconcile, so the timeout is short and failures are treated as "unknown", not fatal.
-func NewHTTPClient(timeout time.Duration) *HTTPClient {
-	return &HTTPClient{HTTP: &http.Client{Timeout: timeout}}
+// NewHTTPClient returns a client with a separate bound for reads and for a leave.
+//
+// The shared http.Client carries no Timeout of its own. Each call attaches its own deadline to the
+// request context instead, which bounds the dial, the response and the body read alike, and lets
+// one client hold two different bounds.
+func NewHTTPClient(readTimeout, leaveTimeout time.Duration) *HTTPClient {
+	return &HTTPClient{HTTP: &http.Client{}, ReadTimeout: readTimeout, LeaveTimeout: leaveTimeout}
+}
+
+// bound derives a deadline context from ctx. A non-positive duration means "no bound of our own",
+// which leaves the caller's context as the only limit.
+func bound(ctx context.Context, d time.Duration) (context.Context, context.CancelFunc) {
+	if d <= 0 {
+		return context.WithCancel(ctx)
+	}
+	return context.WithTimeout(ctx, d)
 }
 
 func (c *HTTPClient) get(ctx context.Context, url string, out any) (int, error) {
@@ -171,6 +203,9 @@ func (c *HTTPClient) get(ctx context.Context, url string, out any) (int, error) 
 
 // Membership implements Client.
 func (c *HTTPClient) Membership(ctx context.Context, baseURL string) (*Membership, error) {
+	ctx, cancel := bound(ctx, c.ReadTimeout)
+	defer cancel()
+
 	var m Membership
 	code, err := c.get(ctx, baseURL+"/v1/cluster/membership", &m)
 	if err != nil {
@@ -187,6 +222,9 @@ func (c *HTTPClient) Membership(ctx context.Context, baseURL string) (*Membershi
 // 503 is the documented "up but not serving" answer and carries a valid body, so it is decoded
 // and returned rather than surfaced as an error.
 func (c *HTTPClient) Health(ctx context.Context, baseURL string) (*Health, error) {
+	ctx, cancel := bound(ctx, c.ReadTimeout)
+	defer cancel()
+
 	var h Health
 	code, err := c.get(ctx, baseURL+"/v1/cluster/health", &h)
 	if err != nil {
@@ -201,10 +239,17 @@ func (c *HTTPClient) Health(ctx context.Context, baseURL string) (*Health, error
 // Leave implements Client.
 //
 // The server answers every documented outcome with a body — 200 committed or already-gone, 409 the
-// permanent last-voter refusal, 503 not-initialized or no-leader, 504 unresolved before the
-// deadline — so the status code is not consulted here beyond decoding. The caller branches on
-// Outcome, which carries the distinction that matters.
+// permanent last-voter refusal, 503 not-initialized, no-leader or another node mid-drain, 504
+// unresolved before the deadline — so the status code is not consulted here beyond decoding. The
+// caller branches on Outcome, which carries the distinction that matters.
+//
+// Every outcome the operator does not name is retryable on the server's own classification, so an
+// unrecognized one holds the scale and is tried again. That covers DrainTimedOut, which resumes
+// the drain rather than restarting it: replicas already moved stay moved.
 func (c *HTTPClient) Leave(ctx context.Context, baseURL string) (*LeaveResult, error) {
+	ctx, cancel := bound(ctx, c.LeaveTimeout)
+	defer cancel()
+
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, baseURL+"/v1/cluster/leave", nil)
 	if err != nil {
 		return nil, err

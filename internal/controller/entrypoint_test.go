@@ -279,6 +279,22 @@ func TestStaticArgsBindRaftPortAsHTTPS(t *testing.T) {
 	}
 }
 
+// A keystore is always configured, and from Kahuna 1.8.x that alone suppresses every cleartext
+// listener. Without this flag --http-ports binds nothing, which takes out both probes and the
+// operator's own membership and leave calls at once.
+func TestStaticArgsAllowPlaintextListenerBesideTLS(t *testing.T) {
+	args := staticArgs(testCluster(3))
+	if !hasFlag(args, "--https-certificate") {
+		t.Fatal("--https-certificate missing; the rest of this test assumes a keystore is configured")
+	}
+	if !hasFlag(args, "--allow-plaintext-listener") {
+		t.Error("--allow-plaintext-listener missing; the plaintext ports will not bind beside a keystore")
+	}
+	if got := argValues(args, "--http-ports"); len(got) != 2 || got[0] != "2070" || got[1] != "8081" {
+		t.Errorf("--http-ports = %v, want [2070 8081]", got)
+	}
+}
+
 // Scaling must NOT change the pod template. Topology is read from a mounted file at startup, so
 // growing a cluster adds a node instead of first restarting every existing one.
 func TestConfigHashIsStableAcrossScale(t *testing.T) {

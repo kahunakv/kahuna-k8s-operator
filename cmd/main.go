@@ -20,7 +20,6 @@ import (
 	"crypto/tls"
 	"flag"
 	"os"
-	"time"
 
 	// Import all Kubernetes client auth plugins (e.g. Azure, GCP, OIDC, etc.)
 	// to ensure that exec-entrypoint and run can make use of them.
@@ -194,9 +193,12 @@ func main() {
 	if err := (&controller.KahunaClusterReconciler{
 		Client: mgr.GetClient(),
 		Scheme: mgr.GetScheme(),
-		// Short timeout: a status read must never wedge a reconcile. An unreachable node is
-		// reported as an unknown roster, not as an error.
-		Kahuna: kahuna.NewHTTPClient(5 * time.Second),
+		// Two bounds, because the two calls differ. A status read stays short, so it never
+		// wedges a reconcile; an unreachable node is reported as an unknown roster, not as an
+		// error. A leave gets the server's own bound, because the server holds that request
+		// open while it evacuates the departing node's replicas, and a client that gives up
+		// first cancels the evacuation.
+		Kahuna: kahuna.NewHTTPClient(kahuna.DefaultReadTimeout, kahuna.DefaultLeaveTimeout),
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "Failed to create controller", "controller", "kahunacluster")
 		os.Exit(1)

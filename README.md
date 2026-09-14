@@ -152,6 +152,21 @@ stuck on a missing volume with no explanation.
 `spec.tls.insecureSkipVerify` defaults to `true`, which is what a self-signed in-cluster keystore
 needs. Set it to `false` when the issuer's CA is in the image's trust store.
 
+## Server version
+
+**Kahuna 1.8.1 or newer.** This is a floor, not a preference. Two things tie the operator to it:
+
+- From 1.8.x a configured `--https-certificate` suppresses every cleartext listener unless
+  `--allow-plaintext-listener` is also given. The operator always configures a keystore, so it
+  always passes that flag. Both probes and the operator's own membership and leave calls use the
+  plaintext port, so all three go dark without it.
+- Kahuna's command-line parser rejects an option it does not define rather than ignoring it, so an
+  older server fails at startup on that same flag.
+
+`spec.image` therefore defaults to an exact tag, `kahunakv/kahuna:1.8.1`, rather than to `latest`.
+A floating tag re-rolls a running cluster on a registry push, and the generated command line is
+version-specific. Raise the tag deliberately, after checking the flags against that release.
+
 ## Install
 
 ```bash

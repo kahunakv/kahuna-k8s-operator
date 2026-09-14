@@ -387,7 +387,12 @@ type KahunaClusterSpec struct {
 
 	// image is the Kahuna server image. The operator overrides the image entrypoint with its own
 	// generated startup script, so the stock single-node image works unmodified.
-	// +kubebuilder:default="kahunakv/kahuna:latest"
+	//
+	// The default is pinned to an exact version rather than to a floating tag. A cluster whose
+	// image moves on its own re-rolls every node on a registry push, and the generated command
+	// line is version-specific: a flag the new server no longer accepts stops the node at
+	// startup. Raise this default deliberately, once the flags are checked against that release.
+	// +kubebuilder:default="kahunakv/kahuna:1.8.1"
 	// +optional
 	Image string `json:"image,omitempty"`
 

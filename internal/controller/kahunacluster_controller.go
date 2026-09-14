@@ -33,6 +33,9 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+
+	// Aliased because this package is itself named controller.
+	ctrlcontroller "sigs.k8s.io/controller-runtime/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
@@ -48,6 +51,22 @@ const requeueProgressing = 10 * time.Second
 // any Kubernetes object changing — a SWIM eviction, for instance — so status would go stale
 // without a periodic re-read.
 const requeueSteady = 60 * time.Second
+
+// maxConcurrentReconciles raises the worker count above controller-runtime's default of 1.
+//
+// One worker is too few here because a reconcile can legitimately block for a long time: a
+// graceful leave holds its request open while the departing node's replicas are evacuated, up to
+// the server's own drain timeout. On a single worker that wait stalls every other KahunaCluster,
+// so one cluster's scale-down would freeze the rest.
+//
+// Running them in parallel is safe. Each object's reconcile touches only the resources it owns,
+// which are named after that cluster and therefore disjoint, and it writes only its own status.
+// The reconciler itself carries no mutable shared state: the Kubernetes client and the Kahuna
+// HTTP client are both safe for concurrent use, and the Scheme is read-only after setup.
+//
+// Reconciles of the SAME object are still serialized by controller-runtime's per-key workqueue,
+// which is what keeps a one-node-at-a-time membership change one-at-a-time.
+const maxConcurrentReconciles = 4
 
 // KahunaClusterReconciler reconciles a KahunaCluster object
 type KahunaClusterReconciler struct {
@@ -425,5 +444,6 @@ func (r *KahunaClusterReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Owns(&corev1.ConfigMap{}).
 		Owns(&policyv1.PodDisruptionBudget{}).
 		Named("kahunacluster").
+		WithOptions(ctrlcontroller.Options{MaxConcurrentReconciles: maxConcurrentReconciles}).
 		Complete(r)
 }

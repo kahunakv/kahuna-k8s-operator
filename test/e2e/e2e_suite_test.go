@@ -41,7 +41,12 @@ var (
 	// It is a pinned published tag rather than :latest so a green run stays green: an upstream
 	// image push must not turn an unrelated pull request red. Override it to test a locally built
 	// server, or bump it deliberately to pick up a new release.
-	kahunaImage = envOr("KAHUNA_IMAGE", "kahunakv/kahuna:1.0.8")
+	//
+	// 1.8.1 is also the operator's floor, not merely its current choice. The generated command
+	// line passes --allow-plaintext-listener, which older servers do not define, and Kahuna's
+	// parser rejects an option it does not know rather than ignoring it. An earlier tag here
+	// fails every node at startup.
+	kahunaImage = envOr("KAHUNA_IMAGE", "kahunakv/kahuna:1.8.1")
 )
 
 // envOr reads an environment variable with a fallback.
