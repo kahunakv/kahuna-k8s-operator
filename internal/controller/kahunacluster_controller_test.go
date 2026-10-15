@@ -32,6 +32,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/utils/ptr"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	kahunav1alpha1 "github.com/kahunakv/k8s-operator/api/v1alpha1"
@@ -93,6 +94,22 @@ func (f *fakeKahuna) Leave(_ context.Context, baseURL string) (*kahuna.LeaveResu
 		return f.leaveResult, nil
 	}
 	return &kahuna.LeaveResult{Left: true, Outcome: kahuna.OutcomeCommitted}, nil
+}
+
+// staleCache stands in for an informer cache that has not yet seen the controller's own last
+// status write: every Get of the KahunaCluster returns the snapshot it was given, while every
+// other object is read live.
+type staleCache struct {
+	client.Client
+	snapshot *kahunav1alpha1.KahunaCluster
+}
+
+func (c *staleCache) Get(ctx context.Context, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+	if out, ok := obj.(*kahunav1alpha1.KahunaCluster); ok && key.Name == c.snapshot.Name {
+		c.snapshot.DeepCopyInto(out)
+		return nil
+	}
+	return c.Client.Get(ctx, key, obj, opts...)
 }
 
 // rosterOf builds a roster of Voters for ordinals 0..n-1 of the given cluster.
@@ -518,6 +535,41 @@ var _ = Describe("KahunaCluster Controller", func() {
 			reconcileUsing(&fakeKahuna{membership: rosterOf(cluster, 3), metrics: idle})
 			Expect(getCluster().Status.Autoscaling.DesiredReplicas).To(Equal(int32(3)),
 				"scaled below minReplicas")
+		})
+
+		It("does not regrow the cluster from a cached status the previous pass already moved", func() {
+			autoscale()
+			idle := steadyLoad(0)
+
+			reconcileUsing(&fakeKahuna{membership: rosterOf(cluster, 4), metrics: idle})
+			reconcileUsing(&fakeKahuna{membership: rosterOf(cluster, 4), metrics: idle})
+			before := getCluster()
+			Expect(before.Status.Autoscaling.DesiredReplicas).To(Equal(int32(4)))
+
+			// This pass decides 4 -> 3, asks kahuna-3 to leave and shrinks the StatefulSet.
+			reconcileUsing(&fakeKahuna{membership: rosterOf(cluster, 4), metrics: idle})
+			Expect(getCluster().Status.Autoscaling.DesiredReplicas).To(Equal(int32(3)))
+			Expect(*getSTS().Spec.Replicas).To(Equal(int32(3)))
+
+			// The next pass runs before the cache has caught up with that status write, while the
+			// roster has already converged at 3. Through the cache the cluster still wants 4
+			// nodes, and growing to it would recreate the node that was just decommissioned.
+			reconciler = &KahunaClusterReconciler{
+				Client: &staleCache{Client: k8sClient, snapshot: before},
+				Reader: k8sClient,
+				Scheme: k8sClient.Scheme(),
+			}
+			// Run the pass by hand: the StatefulSet is checked before the pass's own result,
+			// because the regrowth is a write that lands before the status update fails.
+			ensurePods(3)
+			syncSTSStatus(3)
+			fake := &fakeKahuna{membership: rosterOf(cluster, 3), metrics: idle}
+			reconciler.Kahuna = fake
+			_, rerr := reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: nn})
+			Expect(*getSTS().Spec.Replicas).To(Equal(int32(3)), "a stale cache regrew the StatefulSet")
+			Expect(rerr).NotTo(HaveOccurred())
+			Expect(fake.leaveCalls).To(BeEmpty(), "a converged cluster asked a node to leave")
+			Expect(getCluster().Status.Autoscaling.DesiredReplicas).To(Equal(int32(3)))
 		})
 
 		It("does not grow a fully replicated cluster past the replication cap", func() {

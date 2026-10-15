@@ -78,6 +78,15 @@ type KahunaClusterReconciler struct {
 	// authoritative record of who is a member: a Running pod need not be one, and a roster entry
 	// can outlive the pod that created it.
 	Kahuna kahuna.Client
+	// Reader fetches the KahunaCluster itself straight from the API server, bypassing the
+	// informer cache. The autoscaler keeps its chosen size in status, which this controller
+	// writes, and a pass that starts right after that write can find the cache still holding the
+	// previous size. Acting on that regrows a StatefulSet the previous pass just shrank: the
+	// decommissioned node comes back, rejoins the roster, and has to be asked to leave again. A
+	// stale StatefulSet read is harmless by comparison — an update carrying an old
+	// resourceVersion is rejected — so only the cluster is read this way. Nil falls back to
+	// Client, which is what the tests use.
+	Reader client.Reader
 
 	// traffic turns the cluster's cumulative counters into rates for the autoscaler.
 	traffic trafficSampler
@@ -99,8 +108,12 @@ type KahunaClusterReconciler struct {
 func (r *KahunaClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	log := logf.FromContext(ctx)
 
+	reader := r.Reader
+	if reader == nil {
+		reader = r.Client
+	}
 	cluster := &kahunav1alpha1.KahunaCluster{}
-	if err := r.Get(ctx, req.NamespacedName, cluster); err != nil {
+	if err := reader.Get(ctx, req.NamespacedName, cluster); err != nil {
 		if apierrors.IsNotFound(err) {
 			r.traffic.forget(req.NamespacedName)
 		}

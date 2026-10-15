@@ -193,6 +193,9 @@ func main() {
 	if err := (&controller.KahunaClusterReconciler{
 		Client: mgr.GetClient(),
 		Scheme: mgr.GetScheme(),
+		// The cluster is read uncached so a pass never acts on a status older than the one the
+		// previous pass wrote; see the field's comment for what goes wrong otherwise.
+		Reader: mgr.GetAPIReader(),
 		// Two bounds, because the two calls differ. A status read stays short, so it never
 		// wedges a reconcile; an unreachable node is reported as an unknown roster, not as an
 		// error. A leave gets the server's own bound, because the server holds that request

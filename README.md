@@ -84,6 +84,13 @@ indistinguishable from a crash and force the cluster through its failure-detecto
 node cannot be reached, or refuses because it is the last voter, the scale **holds** rather than
 falling back to deleting a live member.
 
+**The KahunaCluster is read uncached.** An autoscaled cluster keeps its chosen size in
+`status.autoscaling`, which the operator itself writes, and the informer cache can lag that write
+by a reconcile. A pass that reads the previous size from the cache would regrow the StatefulSet
+the last pass just shrank, bringing back the node it had decommissioned. The reconciler therefore
+fetches the cluster through the manager's API reader; a stale StatefulSet read is harmless, since
+an update carrying an old `resourceVersion` is rejected.
+
 **`replicas: 2` is rejected, and 1 ↔ many is rejected.** A two-Voter cluster has a quorum of 2, so it
 tolerates no failures while costing twice as much as a single node. A single node runs Kahuna in
 standalone mode, which uses a different quorum model and on-disk identity, so it cannot be grown into
