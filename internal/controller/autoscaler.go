@@ -341,27 +341,6 @@ func decideAutoscale(in autoscaleInput) autoscaleDecision {
 	return autoscaleDecision{status: st}
 }
 
-// readPlacement asks a ready node for the committed replica placement. Any node can answer.
-func (r *KahunaClusterReconciler) readPlacement(ctx context.Context, cluster *kahunav1alpha1.KahunaCluster, pods []corev1.Pod) (*kahuna.Placement, error) {
-	var lastErr error
-	for i := range pods {
-		pod := &pods[i]
-		if pod.Status.PodIP == "" || pod.DeletionTimestamp != nil || !podIsReady(pod) {
-			continue
-		}
-		p, err := r.Kahuna.Placement(ctx, podBaseURL(cluster, pod))
-		if err != nil {
-			lastErr = err
-			continue
-		}
-		return p, nil
-	}
-	if lastErr == nil {
-		lastErr = fmt.Errorf("no ready pod to read placement from")
-	}
-	return nil, lastErr
-}
-
 // growthCeiling decides how far the cluster may grow while still honouring the replication cap.
 //
 // A data partition with no replica set lives on every node, so each node added is another copy of
@@ -377,23 +356,22 @@ func growthCeiling(p *kahuna.Placement) (int32, string) {
 	return 0, ""
 }
 
-// placementConverged reports whether the data partitions have settled on the nodes the cluster is
-// sized to, and if not, why. The roster converging says the membership change is committed; this
-// says the data has followed it, which is what makes a node added for capacity actually carry
-// some, and a node removed actually gone from every replica set.
+// placementSettled reports whether the server has finished acting on the last membership change:
+// no replica is in a transitional role, and no replica sits on a node that is no longer a member.
+// Both hold while the server is still moving data, so both are waited for as long as they hold.
+// Replicas are counted per current member on the way, for the share check that builds on this.
 //
-// Two conditions are hard, because the server is still acting on the last step while they hold:
-// no replica may be in a transitional role, and no replica may sit on a node that is no longer a
-// member. The third — every node holding a reasonable share — is what the rebalancer is for, but
-// its planner stops at its own notion of even, so that one is only waited for until settleBy.
-func placementConverged(cluster *kahunav1alpha1.KahunaCluster, p *kahuna.Placement, current int32, now time.Time, settleBy *time.Time) (bool, string) {
+// A nil placement is a server without the feature. It replicates every partition to every node
+// and never moves one, so there is nothing to settle.
+func placementSettled(cluster *kahunav1alpha1.KahunaCluster, p *kahuna.Placement, current int32) (hosted map[string]int, total int, reason string) {
+	hosted = make(map[string]int, current)
+	if p == nil {
+		return hosted, 0, ""
+	}
 	members := make(map[string]bool, current)
 	for i := range current {
 		members[raftEndpoint(cluster, i)] = true
 	}
-
-	hosted := make(map[string]int, current)
-	total := 0
 	var inFlight, stranded []int32
 	for _, part := range p.Partitions {
 		// Partitions without a replica set are on every node; there is nothing to settle.
@@ -412,11 +390,24 @@ func placementConverged(cluster *kahunav1alpha1.KahunaCluster, p *kahuna.Placeme
 			}
 		}
 	}
-	if len(inFlight) > 0 {
-		return false, fmt.Sprintf("replica moves in flight on partitions %v", inFlight)
+	switch {
+	case len(inFlight) > 0:
+		return hosted, total, fmt.Sprintf("replica moves in flight on partitions %v", inFlight)
+	case len(stranded) > 0:
+		return hosted, total, fmt.Sprintf("partitions %v still have replicas on nodes that left", stranded)
 	}
-	if len(stranded) > 0 {
-		return false, fmt.Sprintf("partitions %v still have replicas on nodes that left", stranded)
+	return hosted, total, ""
+}
+
+// placementConverged is placementSettled plus the autoscaler's own requirement that every node
+// carries a reasonable share of the data partitions. The roster converging says the membership
+// change is committed; this says the data has followed it, which is what makes a node added for
+// capacity actually carry some. The share is what the rebalancer is for, but its planner stops at
+// its own notion of even, so that part is only waited for until settleBy.
+func placementConverged(cluster *kahunav1alpha1.KahunaCluster, p *kahuna.Placement, current int32, now time.Time, settleBy *time.Time) (bool, string) {
+	hosted, total, reason := placementSettled(cluster, p, current)
+	if reason != "" {
+		return false, reason
 	}
 	// With fewer placed replicas than nodes some node has to be empty, so there is no share to
 	// wait for; the same goes once the settle clock has run out.
@@ -438,7 +429,7 @@ func placementConverged(cluster *kahunav1alpha1.KahunaCluster, p *kahuna.Placeme
 
 // reconcileAutoscaling updates the autoscaler state in cluster.Status. The caller persists it with
 // the rest of status; every other step of the pass then reads the new size through desiredReplicas.
-func (r *KahunaClusterReconciler) reconcileAutoscaling(ctx context.Context, cluster *kahunav1alpha1.KahunaCluster, bootstrapped bool, membership *kahuna.Membership, pods []corev1.Pod) {
+func (r *KahunaClusterReconciler) reconcileAutoscaling(ctx context.Context, cluster *kahunav1alpha1.KahunaCluster, bootstrapped bool, membership *kahuna.Membership, placement *kahuna.Placement, placementErr error, pods []corev1.Pod) {
 	key := types.NamespacedName{Namespace: cluster.Namespace, Name: cluster.Name}
 	spec := cluster.Spec.Autoscaling
 	if spec == nil {
@@ -468,16 +459,15 @@ func (r *KahunaClusterReconciler) reconcileAutoscaling(ctx context.Context, clus
 
 	// The roster says the step is committed; the placement says whether the data has followed.
 	// Until it has, the previous step is still in progress and the next must not stack on it.
-	var placement *kahuna.Placement
 	waiting := ""
 	if converged {
-		var err error
-		placement, err = r.readPlacement(ctx, cluster, members)
 		switch {
-		case err != nil:
+		case placementErr != nil:
 			// Not knowing whether the data has settled is a reason to wait, same as for growth.
+			// A server without the feature cannot autoscale at all: the factor it needs arrived
+			// with placement, and the replication cap below has nothing to read either.
 			converged = false
-			waiting = fmt.Sprintf("replica placement could not be read: %v", err)
+			waiting = fmt.Sprintf("replica placement could not be read: %v", placementErr)
 		default:
 			var settleBy *time.Time
 			if as := cluster.Status.Autoscaling; as != nil && as.LastScaleTime != nil {

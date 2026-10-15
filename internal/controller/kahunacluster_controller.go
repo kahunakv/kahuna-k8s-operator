@@ -18,6 +18,7 @@ package controller
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
@@ -167,6 +168,18 @@ func (r *KahunaClusterReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		log.V(1).Info("could not read cluster membership", "error", membershipErr)
 	}
 
+	// The placement is what says whether the data has followed the last membership change. It is
+	// read once here for the same reason as the roster, and an unreadable one is handled the same
+	// way: buildPlan holds, because not knowing whether replicas are still moving is not a state
+	// to take another node out of. A server without the feature is the one exception — it never
+	// moves a replica, so there is nothing to wait for — and it is reported as no placement at all.
+	placement, placementErr := r.readPlacement(ctx, cluster, pods)
+	if errors.Is(placementErr, kahuna.ErrPlacementUnsupported) {
+		placement, placementErr = nil, nil
+	} else if placementErr != nil {
+		log.V(1).Info("could not read replica placement", "error", placementErr)
+	}
+
 	// The autoscaler edits cluster.Status in memory, so the stored status is captured first: it is
 	// what the status write has to be compared against, or an autoscaler-only change would look
 	// like no change and never be persisted.
@@ -174,9 +187,9 @@ func (r *KahunaClusterReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 
 	// The autoscaler runs before the StatefulSet is sized because it is what decides the size:
 	// everything below reads the target through desiredReplicas, which consults the state set here.
-	r.reconcileAutoscaling(ctx, cluster, bootstrapped, membership, pods)
+	r.reconcileAutoscaling(ctx, cluster, bootstrapped, membership, placement, placementErr, pods)
 
-	sts, err := r.reconcileStatefulSet(ctx, cluster, bootstrapped, membership, pods)
+	sts, err := r.reconcileStatefulSet(ctx, cluster, bootstrapped, membership, placement, placementErr, pods)
 	if err != nil {
 		return ctrl.Result{}, fmt.Errorf("reconciling stateful set: %w", err)
 	}
@@ -246,7 +259,7 @@ func (r *KahunaClusterReconciler) reconcilePDB(ctx context.Context, cluster *kah
 
 // reconcileStatefulSet creates or updates the StatefulSet, applying the size and rolling-update
 // partition that buildPlan considers safe right now.
-func (r *KahunaClusterReconciler) reconcileStatefulSet(ctx context.Context, cluster *kahunav1alpha1.KahunaCluster, bootstrapped bool, membership *kahuna.Membership, pods []corev1.Pod) (*appsv1.StatefulSet, error) {
+func (r *KahunaClusterReconciler) reconcileStatefulSet(ctx context.Context, cluster *kahunav1alpha1.KahunaCluster, bootstrapped bool, membership *kahuna.Membership, placement *kahuna.Placement, placementErr error, pods []corev1.Pod) (*appsv1.StatefulSet, error) {
 	// bootstrapped decides whether a scale step may be taken at all, not what the pods look like.
 	existing := &appsv1.StatefulSet{}
 	err := r.Get(ctx, types.NamespacedName{Name: stsName(cluster), Namespace: cluster.Namespace}, existing)
@@ -270,7 +283,7 @@ func (r *KahunaClusterReconciler) reconcileStatefulSet(ctx context.Context, clus
 	if existing.Spec.Replicas != nil {
 		currentReplicas = *existing.Spec.Replicas
 	}
-	p := buildPlan(cluster, currentReplicas, bootstrapped, membership)
+	p := buildPlan(cluster, currentReplicas, bootstrapped, membership, placement, placementErr)
 
 	// Shrinking means removing a member, and a member leaves the roster properly by asking. Doing
 	// it here rather than deleting the pod and waiting for the cluster to notice keeps a planned
@@ -455,6 +468,31 @@ func equalStatus(a, b *kahunav1alpha1.KahunaClusterStatus) bool {
 		y.Conditions[i].LastTransitionTime = metav1.Time{}
 	}
 	return apiequality.Semantic.DeepEqual(x, y)
+}
+
+// readPlacement asks a ready node for the committed replica placement. Any node can answer.
+func (r *KahunaClusterReconciler) readPlacement(ctx context.Context, cluster *kahunav1alpha1.KahunaCluster, pods []corev1.Pod) (*kahuna.Placement, error) {
+	var lastErr error
+	for i := range pods {
+		pod := &pods[i]
+		if pod.Status.PodIP == "" || pod.DeletionTimestamp != nil || !podIsReady(pod) {
+			continue
+		}
+		p, err := r.Kahuna.Placement(ctx, podBaseURL(cluster, pod))
+		if err != nil {
+			lastErr = err
+			if errors.Is(err, kahuna.ErrPlacementUnsupported) {
+				// Every node runs the same version; asking another gains nothing.
+				return nil, err
+			}
+			continue
+		}
+		return p, nil
+	}
+	if lastErr == nil {
+		lastErr = fmt.Errorf("no ready pod to read placement from")
+	}
+	return nil, lastErr
 }
 
 // listPods returns the pods belonging to this cluster.

@@ -36,7 +36,7 @@ kahuna   3         3       3        Running   12m
 |---|---|
 | **Provisions** | Headless peer Service, client Service, per-node PVCs, ConfigMap, PodDisruptionBudget, StatefulSet. |
 | **Bootstraps** | Brings up all founding nodes at once so they can form their first quorum, and reports `Running` only when the committed roster carries every node as a Voter. |
-| **Scales** | One node at a time, in both directions, each step gated on the roster — never on what Kubernetes merely believes. Departing nodes are decommissioned through the cluster's leave API before their pods are removed. |
+| **Scales** | One node at a time, in both directions, each step gated on the roster and on the replica placement having settled — never on what Kubernetes merely believes. Departing nodes are decommissioned through the cluster's leave API before their pods are removed. |
 | **Autoscales** | Optional. Adds and removes nodes with write traffic between a minimum and a maximum, one node at a time, and never grows a cluster in a way that would put more than 3 copies on any data partition. |
 | **Upgrades** | Rolling restarts one node at a time, held back automatically whenever the roster is not converged or unreadable. |
 | **Reports** | `status.members` mirrors the committed roster joined to the pods serving it, plus `Available` / `Progressing` / `RosterConverged` conditions. |
@@ -83,6 +83,13 @@ committed (or that it was already gone). Deleting the pod first would make a pla
 indistinguishable from a crash and force the cluster through its failure-detector timeouts. If the
 node cannot be reached, or refuses because it is the last voter, the scale **holds** rather than
 falling back to deleting a live member.
+
+**A step is complete when the data has followed it, not when the roster has.** Before any further
+membership change the operator reads `GET /v1/cluster/placement` and holds while a replica is still
+in a transitional role or still assigned to a node that left. A scale-down that went ahead during
+those repairs would take a second copy from partitions that have already lost one. A server that
+predates placement (before 1.9.11) never moves a replica and is scaled on the roster alone; an
+unreadable placement holds, like an unreadable roster.
 
 **The KahunaCluster is read uncached.** An autoscaled cluster keeps its chosen size in
 `status.autoscaling`, which the operator itself writes, and the informer cache can lag that write

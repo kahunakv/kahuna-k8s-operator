@@ -58,8 +58,10 @@ func rosterMatches(cluster *kahunav1alpha1.KahunaCluster, m *kahuna.Membership, 
 // buildPlan decides the StatefulSet size and rolling-update partition for this pass.
 //
 // currentReplicas is what the StatefulSet is set to right now (not what it has running), and
-// membership may be nil when no node could be reached.
-func buildPlan(cluster *kahunav1alpha1.KahunaCluster, currentReplicas int32, bootstrapped bool, m *kahuna.Membership) plan {
+// membership may be nil when no node could be reached. placement is the committed replica
+// placement, nil with a nil placementErr on a server that has no such thing, and placementErr is
+// set when it exists but could not be read.
+func buildPlan(cluster *kahunav1alpha1.KahunaCluster, currentReplicas int32, bootstrapped bool, m *kahuna.Membership, placement *kahuna.Placement, placementErr error) plan {
 	target := desiredReplicas(cluster)
 
 	// Greenfield: every node must come up at once. Each one blocks until it can form a quorum
@@ -80,6 +82,20 @@ func buildPlan(cluster *kahunav1alpha1.KahunaCluster, currentReplicas int32, boo
 		// the cluster is near its quorum floor it would turn a degraded cluster into a dead one.
 		p.Partition = currentReplicas
 		p.Reason = rosterHoldReason(cluster, m, currentReplicas)
+		return p
+	}
+
+	// The roster converging says the membership change is committed; the placement says whether
+	// the data has followed. A scale-down that goes ahead while the last node's replicas are
+	// still being repaired onto the survivors takes a second copy away from partitions that have
+	// already lost one, and a scale-up that stacks on moves still in flight only adds backfill
+	// to backfill. A rolling update is not held for this: it changes no membership.
+	if placementErr != nil {
+		p.Reason = fmt.Sprintf("waiting for replica placement to become readable: %v", placementErr)
+		return p
+	}
+	if _, _, reason := placementSettled(cluster, placement, currentReplicas); reason != "" {
+		p.Reason = "waiting for replica placement to settle: " + reason
 		return p
 	}
 

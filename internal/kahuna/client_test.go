@@ -18,6 +18,7 @@ package kahuna
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -179,5 +180,19 @@ func TestHealthAcceptsServiceUnavailable(t *testing.T) {
 	}
 	if health.Ready {
 		t.Error("Ready = true, want false")
+	}
+}
+
+func TestPlacementReportsAServerWithoutTheEndpoint(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		http.NotFound(w, nil)
+	}))
+	t.Cleanup(srv.Close)
+
+	c := NewHTTPClient(testLeaveTimeout, testLeaveTimeout)
+
+	_, err := c.Placement(context.Background(), srv.URL)
+	if !errors.Is(err, ErrPlacementUnsupported) {
+		t.Fatalf("a 404 was reported as %v, want ErrPlacementUnsupported", err)
 	}
 }

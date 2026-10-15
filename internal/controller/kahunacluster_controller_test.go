@@ -51,14 +51,19 @@ type fakeKahuna struct {
 	// leaveCalls records which base URLs were asked to leave, so a test can assert the operator
 	// asked before removing rather than just removing.
 	leaveCalls []string
-	// placement is the replica placement reported; nil means every data partition has a replica
-	// set, which is what a cluster created with more nodes than its factor looks like.
+	// placement is the replica placement reported; nil derives a settled one from the roster,
+	// which is what a cluster looks like once the rebalancer has finished with it.
 	placement *kahuna.Placement
+	// placementErr is returned instead, when set.
+	placementErr error
 	// metrics returns the dashboard metrics for a base URL; nil means the endpoint is absent.
 	metrics func(baseURL string) *kahuna.Metrics
 }
 
 func (f *fakeKahuna) Placement(context.Context, string) (*kahuna.Placement, error) {
+	if f.placementErr != nil {
+		return nil, f.placementErr
+	}
 	if f.placement != nil {
 		return f.placement, nil
 	}
@@ -74,7 +79,7 @@ func (f *fakeKahuna) Placement(context.Context, string) (*kahuna.Placement, erro
 		part := kahuna.PartitionPlacement{PartitionID: id, State: kahuna.PartitionStateActive, EffectiveReplicationFactor: 3}
 		for j := range 3 {
 			part.Replicas = append(part.Replicas, kahuna.ReplicaPlacement{
-				Endpoint: f.membership.Members[(int(id)+j)%n].Endpoint, Role: "Voter",
+				Endpoint: f.membership.Members[(int(id)+j)%n].Endpoint, Role: kahuna.RoleVoter,
 			})
 		}
 		p.Partitions = append(p.Partitions, part)
@@ -360,6 +365,61 @@ var _ = Describe("KahunaCluster Controller", func() {
 		Expect(*getSTS().Spec.Replicas).To(Equal(int32(3)))
 	})
 
+	It("holds a manual scale-down while the last node's replicas are still being repaired", func() {
+		reconcileWith(rosterOf(cluster, 3), nil)
+		obj := getCluster()
+		obj.Spec.Replicas = ptr.To(int32(5))
+		Expect(k8sClient.Update(ctx, obj)).To(Succeed())
+		reconcileWith(rosterOf(cluster, 3), nil)
+		reconcileWith(rosterOf(cluster, 4), nil)
+		reconcileWith(rosterOf(cluster, 5), nil)
+		Expect(*getSTS().Spec.Replicas).To(Equal(int32(5)))
+
+		obj = getCluster()
+		obj.Spec.Replicas = ptr.To(int32(3))
+		Expect(k8sClient.Update(ctx, obj)).To(Succeed())
+		reconcileWith(rosterOf(cluster, 5), nil)
+		Expect(*getSTS().Spec.Replicas).To(Equal(int32(4)))
+
+		// The roster has let kahuna-4 go, but its replicas have not been repaired onto the
+		// survivors yet: a partition still lists it. Taking kahuna-3 away now would remove a
+		// second copy from partitions that have already lost one.
+		stale, _ := (&fakeKahuna{membership: rosterOf(cluster, 5)}).Placement(ctx, "")
+		fake := reconcileUsing(&fakeKahuna{membership: rosterOf(cluster, 4), placement: stale})
+		Expect(*getSTS().Spec.Replicas).To(Equal(int32(4)), "scaled down while replicas were stranded on the departed node")
+		Expect(fake.leaveCalls).To(BeEmpty(), "asked a node to leave while repairs were still running")
+
+		// Repairs done: the placement names only members again, and the next step proceeds.
+		reconcileWith(rosterOf(cluster, 4), nil)
+		Expect(*getSTS().Spec.Replicas).To(Equal(int32(3)))
+	})
+
+	It("holds a manual scale-up while replicas are still moving onto the last node", func() {
+		reconcileWith(rosterOf(cluster, 3), nil)
+		obj := getCluster()
+		obj.Spec.Replicas = ptr.To(int32(5))
+		Expect(k8sClient.Update(ctx, obj)).To(Succeed())
+		reconcileWith(rosterOf(cluster, 3), nil)
+		Expect(*getSTS().Spec.Replicas).To(Equal(int32(4)))
+
+		moving, _ := (&fakeKahuna{membership: rosterOf(cluster, 4)}).Placement(ctx, "")
+		moving.Partitions[0].Replicas[0].Role = kahuna.RoleLearner
+		reconcileUsing(&fakeKahuna{membership: rosterOf(cluster, 4), placement: moving})
+		Expect(*getSTS().Spec.Replicas).To(Equal(int32(4)), "stacked a scale-up on replica moves still in flight")
+
+		reconcileWith(rosterOf(cluster, 4), nil)
+		Expect(*getSTS().Spec.Replicas).To(Equal(int32(5)))
+	})
+
+	It("scales a server without replica placement on the roster alone", func() {
+		reconcileWith(rosterOf(cluster, 3), nil)
+		obj := getCluster()
+		obj.Spec.Replicas = ptr.To(int32(5))
+		Expect(k8sClient.Update(ctx, obj)).To(Succeed())
+		reconcileUsing(&fakeKahuna{membership: rosterOf(cluster, 3), placementErr: kahuna.ErrPlacementUnsupported})
+		Expect(*getSTS().Spec.Replicas).To(Equal(int32(4)))
+	})
+
 	It("asks the departing node to leave before removing its pod", func() {
 		reconcileWith(rosterOf(cluster, 3), nil)
 		obj := getCluster()
@@ -565,7 +625,7 @@ var _ = Describe("KahunaCluster Controller", func() {
 			// moving a replica onto it. The roster alone would call this converged.
 			moving := rosterOf(cluster, 5)
 			settled, _ := (&fakeKahuna{membership: moving}).Placement(ctx, "")
-			settled.Partitions[0].Replicas[0].Role = "Learner"
+			settled.Partitions[0].Replicas[0].Role = kahuna.RoleLearner
 			reconcileUsing(&fakeKahuna{membership: moving, metrics: load, placement: settled})
 			reconcileUsing(&fakeKahuna{membership: moving, metrics: load, placement: settled})
 			out := getCluster()

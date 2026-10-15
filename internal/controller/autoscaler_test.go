@@ -245,7 +245,7 @@ func placed(parts ...[]kahuna.ReplicaPlacement) *kahuna.Placement {
 func voters(cluster *kahunav1alpha1.KahunaCluster, ordinals ...int32) []kahuna.ReplicaPlacement {
 	out := make([]kahuna.ReplicaPlacement, 0, len(ordinals))
 	for _, o := range ordinals {
-		out = append(out, kahuna.ReplicaPlacement{Endpoint: raftEndpoint(cluster, o), Role: "Voter"})
+		out = append(out, kahuna.ReplicaPlacement{Endpoint: raftEndpoint(cluster, o), Role: kahuna.RoleVoter})
 	}
 	return out
 }
@@ -261,7 +261,7 @@ func TestPlacementConvergedWaitsForMovesAndStrandedReplicas(t *testing.T) {
 
 	// A Learner is a move in flight, however long it has been going on.
 	moving := placed(voters(cluster, 0, 1, 2), voters(cluster, 1, 2, 3), voters(cluster, 2, 3, 0), voters(cluster, 3, 0, 1))
-	moving.Partitions[1].Replicas[2].Role = "Learner"
+	moving.Partitions[1].Replicas[2].Role = kahuna.RoleLearner
 	settleBy := t0.Add(-time.Hour)
 	if ok, why := placementConverged(cluster, moving, 4, t0, &settleBy); ok || why == "" {
 		t.Fatal("a replica move in flight was treated as converged")
@@ -275,6 +275,10 @@ func TestPlacementConvergedWaitsForMovesAndStrandedReplicas(t *testing.T) {
 	// Fully replicated partitions have no replica set and nothing to settle.
 	if ok, _ := placementConverged(cluster, placed(nil, nil), 4, t0, nil); !ok {
 		t.Fatal("fully replicated partitions blocked convergence")
+	}
+	// A server without replica placement never moves a replica: nothing to settle.
+	if _, _, why := placementSettled(cluster, nil, 4); why != "" {
+		t.Fatalf("a server without placement was held: %s", why)
 	}
 	// Three single-copy partitions on four nodes: one node is empty by arithmetic, not by delay.
 	sparse := placed(voters(cluster, 0), voters(cluster, 1), voters(cluster, 2))

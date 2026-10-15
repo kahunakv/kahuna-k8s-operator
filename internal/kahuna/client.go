@@ -23,6 +23,7 @@ package kahuna
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -294,6 +295,12 @@ func (c *HTTPClient) get(ctx context.Context, url string, out any) (int, error) 
 		return resp.StatusCode, err
 	}
 	if err := json.Unmarshal(body, out); err != nil {
+		// A refusal need not carry the document that was asked for — a 404 comes with a plain
+		// text body — and the status is then the whole answer. A 200 that does not decode is a
+		// real error.
+		if resp.StatusCode != http.StatusOK {
+			return resp.StatusCode, nil
+		}
 		return resp.StatusCode, fmt.Errorf("decoding %s (status %d): %w", url, resp.StatusCode, err)
 	}
 	return resp.StatusCode, nil
@@ -334,6 +341,11 @@ func (c *HTTPClient) Health(ctx context.Context, baseURL string) (*Health, error
 	return &h, nil
 }
 
+// ErrPlacementUnsupported is returned by Placement when the server predates replica placement
+// (added in 1.9.11). Such a server replicates every partition to every node and never moves a
+// replica, so there is no placement to wait for.
+var ErrPlacementUnsupported = errors.New("the server does not support replica placement")
+
 // Placement implements Client.
 func (c *HTTPClient) Placement(ctx context.Context, baseURL string) (*Placement, error) {
 	ctx, cancel := bound(ctx, c.ReadTimeout)
@@ -344,10 +356,14 @@ func (c *HTTPClient) Placement(ctx context.Context, baseURL string) (*Placement,
 	if err != nil {
 		return nil, err
 	}
-	if code != http.StatusOK {
+	switch code {
+	case http.StatusOK:
+		return &p, nil
+	case http.StatusNotFound:
+		return nil, ErrPlacementUnsupported
+	default:
 		return nil, fmt.Errorf("placement query returned HTTP %d", code)
 	}
-	return &p, nil
 }
 
 // Metrics implements Client.
