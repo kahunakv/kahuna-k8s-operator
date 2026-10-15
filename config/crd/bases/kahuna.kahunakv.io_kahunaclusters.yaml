@@ -21,6 +21,9 @@ spec:
     - jsonPath: .spec.replicas
       name: Desired
       type: integer
+    - jsonPath: .status.autoscaling.desiredReplicas
+      name: Autoscaled
+      type: integer
     - jsonPath: .status.readyReplicas
       name: Ready
       type: integer
@@ -976,6 +979,72 @@ spec:
                         x-kubernetes-list-type: atomic
                     type: object
                 type: object
+              autoscaling:
+                description: autoscaling lets the operator add and remove nodes with
+                  traffic.
+                properties:
+                  maxReplicas:
+                    description: maxReplicas is the ceiling.
+                    format: int32
+                    minimum: 3
+                    type: integer
+                  minReplicas:
+                    description: |-
+                      minReplicas is the floor. It must be at least 3: one node runs in standalone mode and cannot
+                      grow, and two nodes tolerate no failures.
+                    format: int32
+                    minimum: 3
+                    type: integer
+                  scaleDownStabilizationSeconds:
+                    default: 300
+                    description: |-
+                      scaleDownStabilizationSeconds is how long load must stay below target before a node is
+                      removed. Longer than the scale-up window on purpose: a removal costs a drain and a later
+                      re-add costs a catch-up, so flapping is expensive.
+                    format: int32
+                    minimum: 0
+                    type: integer
+                  scaleUpStabilizationSeconds:
+                    default: 60
+                    description: scaleUpStabilizationSeconds is how long load must
+                      stay above target before a node is added.
+                    format: int32
+                    minimum: 0
+                    type: integer
+                  targetQueueDepth:
+                    description: |-
+                      targetQueueDepth is the number of client proposals each node should have waiting on average
+                      across its partition executors (raft.executor.client_queue_depth). It reflects pressure from
+                      every kind of write.
+                    format: int32
+                    minimum: 1
+                    type: integer
+                  targetWritesPerSecond:
+                    description: |-
+                      targetWritesPerSecond is the direct key/value write rate each node should carry on average
+                      (kahuna.kv.write.admitted). Transactional writes are not counted by that metric; use
+                      targetQueueDepth to cover them.
+                    format: int32
+                    minimum: 1
+                    type: integer
+                  tolerancePercent:
+                    default: 10
+                    description: tolerancePercent is the dead band around the target
+                      inside which no step is recommended.
+                    format: int32
+                    maximum: 100
+                    minimum: 0
+                    type: integer
+                required:
+                - maxReplicas
+                - minReplicas
+                type: object
+                x-kubernetes-validations:
+                - message: autoscaling.maxReplicas must be >= autoscaling.minReplicas
+                  rule: self.maxReplicas >= self.minReplicas
+                - message: autoscaling needs at least one of targetWritesPerSecond
+                    or targetQueueDepth
+                  rule: has(self.targetWritesPerSecond) || has(self.targetQueueDepth)
               extraArgs:
                 description: |-
                   extraArgs are appended verbatim to the server command line, after every flag the operator
@@ -985,7 +1054,7 @@ spec:
                   type: string
                 type: array
               image:
-                default: kahunakv/kahuna:1.8.1
+                default: kahunakv/kahuna:1.12.2
                 description: |-
                   image is the Kahuna server image. The operator overrides the image entrypoint with its own
                   generated startup script, so the stock single-node image works unmodified.
@@ -1417,9 +1486,32 @@ spec:
                   quorum model and a different on-disk identity. It is fine for development, but a
                   single-node cluster cannot later be grown into a real one, which is why growing away from
                   1 is rejected below rather than silently corrupting the node's state.
+
+                  When autoscaling is set, replicas is only the starting size (clamped to the autoscaling
+                  bounds); after that the autoscaler owns the node count and edits here are ignored.
                 format: int32
                 minimum: 1
                 type: integer
+              replication:
+                description: replication caps how many nodes hold each data partition.
+                  Required for autoscaling.
+                properties:
+                  factor:
+                    description: |-
+                      factor is the number of voter replicas of each data partition (--raft-replication-factor).
+                      The system partition always spans every node regardless.
+
+                      The server applies the factor only to partitions created while the cluster has more nodes
+                      than the factor, and it never converts a fully replicated partition afterwards. A cluster
+                      created with 3 nodes and factor 3 therefore stays fully replicated; create it with at least
+                      4 nodes to get real placement.
+                    format: int32
+                    maximum: 3
+                    minimum: 1
+                    type: integer
+                required:
+                - factor
+                type: object
               resources:
                 description: resources for the Kahuna container.
                 properties:
@@ -2175,6 +2267,50 @@ spec:
           status:
             description: status defines the observed state of KahunaCluster
             properties:
+              autoscaling:
+                description: autoscaling is the autoscaler's state. Present only while
+                  spec.autoscaling is set.
+                properties:
+                  aboveTargetSince:
+                    description: |-
+                      aboveTargetSince is when the recommendation first rose above desiredReplicas without
+                      interruption. Cleared whenever it drops back or a step is taken.
+                    format: date-time
+                    type: string
+                  belowTargetSince:
+                    description: |-
+                      belowTargetSince is when the recommendation first fell below desiredReplicas without
+                      interruption. Cleared whenever it rises back or a step is taken.
+                    format: date-time
+                    type: string
+                  desiredReplicas:
+                    description: |-
+                      desiredReplicas is the node count the autoscaler has chosen. It replaces spec.replicas as the
+                      target while autoscaling is enabled.
+                    format: int32
+                    type: integer
+                  lastScaleTime:
+                    description: lastScaleTime is when the autoscaler last changed
+                      desiredReplicas.
+                    format: date-time
+                    type: string
+                  queueDepthPerNode:
+                    description: queueDepthPerNode is the latest measured average
+                      client queue depth per node.
+                    format: int64
+                    type: integer
+                  recommendedReplicas:
+                    description: |-
+                      recommendedReplicas is what the latest signals ask for, before bounds, stabilization and the
+                      one-node-at-a-time rule are applied.
+                    format: int32
+                    type: integer
+                  writesPerSecondPerNode:
+                    description: writesPerSecondPerNode is the latest measured average
+                      direct write rate per node.
+                    format: int64
+                    type: integer
+                type: object
               bootstrapSize:
                 description: |-
                   bootstrapSize is the replica count the cluster was first created at. It is pinned when the
@@ -2355,6 +2491,10 @@ spec:
             cluster, or vice versa: the two use different quorum models and on-disk
             identities. Create a new KahunaCluster and migrate the data.'
           rule: (oldSelf.spec.replicas == 1) == (self.spec.replicas == 1)
+        - message: 'autoscaling requires spec.replication: without a replication factor
+            every node holds every partition, so adding nodes adds copies rather than
+            capacity'
+          rule: '!has(self.spec.autoscaling) || has(self.spec.replication)'
     served: true
     storage: true
     subresources:

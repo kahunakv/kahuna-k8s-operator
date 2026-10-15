@@ -163,10 +163,30 @@ func ports(cluster *kahunav1alpha1.KahunaCluster) kahunav1alpha1.PortsSpec {
 	return p
 }
 
-// desiredReplicas resolves spec.replicas, defaulting to 3.
+// desiredReplicas is the node count the cluster is being driven toward. Under autoscaling that is
+// the autoscaler's choice, not spec.replicas: everything that sizes the cluster — the StatefulSet,
+// the topology file, the PDB, status — must agree on one number, and only one actor may own it.
 func desiredReplicas(cluster *kahunav1alpha1.KahunaCluster) int32 {
+	if cluster.Spec.Autoscaling != nil {
+		if as := cluster.Status.Autoscaling; as != nil && as.DesiredReplicas > 0 {
+			return as.DesiredReplicas
+		}
+		return initialAutoscaledReplicas(cluster)
+	}
+	return specReplicas(cluster)
+}
+
+// specReplicas resolves spec.replicas, defaulting to 3.
+func specReplicas(cluster *kahunav1alpha1.KahunaCluster) int32 {
 	if cluster.Spec.Replicas == nil {
 		return 3
 	}
 	return *cluster.Spec.Replicas
+}
+
+// initialAutoscaledReplicas is where the autoscaler starts before it has chosen anything:
+// spec.replicas, held inside the autoscaling bounds.
+func initialAutoscaledReplicas(cluster *kahunav1alpha1.KahunaCluster) int32 {
+	as := cluster.Spec.Autoscaling
+	return min(max(specReplicas(cluster), as.MinReplicas), as.MaxReplicas)
 }

@@ -120,6 +120,16 @@ func staticArgs(cluster *kahunav1alpha1.KahunaCluster) []string {
 	args = boolFlag(args, "--raft-allow-insecure-certificate-validation",
 		cluster.Spec.TLS.InsecureSkipVerify, true)
 
+	if rep := cluster.Spec.Replication; rep != nil {
+		// The rebalancer comes with the factor, not as a separate knob. Initial placement happens
+		// without it, but a node added later receives replicas only through rebalancing moves — so a
+		// factor without the rebalancer means every scale-up adds a node that holds no data.
+		args = append(args,
+			"--raft-replication-factor", fmt.Sprintf("%d", rep.Factor),
+			"--raft-enable-placement-rebalancer",
+		)
+	}
+
 	if r := cluster.Spec.Raft; r != nil {
 		args = flagArgs(args, "--raft-heartbeat-interval", r.HeartbeatIntervalMs)
 		args = flagArgs(args, "--raft-voting-timeout", r.VotingTimeoutMs)

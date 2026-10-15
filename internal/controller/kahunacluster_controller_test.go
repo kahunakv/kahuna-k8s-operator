@@ -27,6 +27,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	policyv1 "k8s.io/api/policy/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -49,6 +50,27 @@ type fakeKahuna struct {
 	// leaveCalls records which base URLs were asked to leave, so a test can assert the operator
 	// asked before removing rather than just removing.
 	leaveCalls []string
+	// placement is the replica placement reported; nil means every data partition has a replica
+	// set, which is what a cluster created with more nodes than its factor looks like.
+	placement *kahuna.Placement
+	// metrics returns the dashboard metrics for a base URL; nil means the endpoint is absent.
+	metrics func(baseURL string) *kahuna.Metrics
+}
+
+func (f *fakeKahuna) Placement(context.Context, string) (*kahuna.Placement, error) {
+	if f.placement != nil {
+		return f.placement, nil
+	}
+	return &kahuna.Placement{ReplicationFactor: 3, Initialized: true, Partitions: []kahuna.PartitionPlacement{
+		{PartitionID: 1, State: kahuna.PartitionStateActive, Replicas: []kahuna.ReplicaPlacement{{Endpoint: "a"}, {Endpoint: "b"}, {Endpoint: "c"}}},
+	}}, nil
+}
+
+func (f *fakeKahuna) Metrics(_ context.Context, baseURL string) (*kahuna.Metrics, error) {
+	if f.metrics == nil {
+		return nil, fmt.Errorf("metrics query returned HTTP 404")
+	}
+	return f.metrics(baseURL), nil
 }
 
 func (f *fakeKahuna) Membership(context.Context, string) (*kahuna.Membership, error) {
@@ -422,6 +444,145 @@ var _ = Describe("KahunaCluster Controller", func() {
 		reconcileWith(rosterOf(cluster, 3), nil)
 
 		Expect(getSTS().Spec.Template.Annotations[configHashAnnotation]).NotTo(Equal(before))
+	})
+
+	Context("with autoscaling", func() {
+		// steadyLoad returns a metrics source where every node admits writesPerNode writes per
+		// second. Each call advances the node's clock by 15 s, past the sampler's minimum interval.
+		steadyLoad := func(writesPerNode float64) func(string) *kahuna.Metrics {
+			clocks := map[string]int64{}
+			return func(baseURL string) *kahuna.Metrics {
+				clocks[baseURL] += 15_000
+				total := writesPerNode * float64(clocks[baseURL]) / 1000
+				return &kahuna.Metrics{MonotonicMs: clocks[baseURL], Rows: []kahuna.MetricRow{{
+					Metric: metricWritesAdmitted, Kind: kahuna.MetricKindCounter, Total: ptr.To(total),
+				}}}
+			}
+		}
+
+		// autoscale turns the test's cluster into an autoscaled one founded at 4 nodes, which is the
+		// smallest size at which a replication factor of 3 produces real placement.
+		autoscale := func() {
+			obj := getCluster()
+			obj.Spec.Replicas = ptr.To(int32(4))
+			obj.Spec.Replication = &kahunav1alpha1.ReplicationSpec{Factor: 3}
+			obj.Spec.Autoscaling = &kahunav1alpha1.AutoscalingSpec{
+				MinReplicas:                   3,
+				MaxReplicas:                   6,
+				TargetWritesPerSecond:         ptr.To(int32(1000)),
+				ScaleUpStabilizationSeconds:   ptr.To(int32(0)),
+				ScaleDownStabilizationSeconds: ptr.To(int32(0)),
+			}
+			Expect(k8sClient.Update(ctx, obj)).To(Succeed())
+		}
+
+		It("adds a node under load, one at a time", func() {
+			autoscale()
+			load := steadyLoad(5000)
+
+			reconcileUsing(&fakeKahuna{membership: rosterOf(cluster, 4), metrics: load})
+			// The first converged pass has no rate yet: one reading is not a rate.
+			reconcileUsing(&fakeKahuna{membership: rosterOf(cluster, 4), metrics: load})
+			Expect(*getSTS().Spec.Replicas).To(Equal(int32(4)))
+
+			reconcileUsing(&fakeKahuna{membership: rosterOf(cluster, 4), metrics: load})
+			out := getCluster()
+			Expect(out.Status.Autoscaling.DesiredReplicas).To(Equal(int32(5)))
+			Expect(out.Status.Autoscaling.RecommendedReplicas).To(Equal(int32(6)))
+			Expect(*out.Status.Autoscaling.WritesPerSecondPerNode).To(Equal(int64(5000)))
+			Expect(*getSTS().Spec.Replicas).To(Equal(int32(5)))
+
+			// The new node has not joined: the autoscaler must not stack a second step on it.
+			reconcileUsing(&fakeKahuna{membership: rosterOf(cluster, 4), metrics: load})
+			Expect(getCluster().Status.Autoscaling.DesiredReplicas).To(Equal(int32(5)))
+			Expect(*getSTS().Spec.Replicas).To(Equal(int32(5)))
+
+			// spec.replicas is only the starting size; the autoscaler owns the count now.
+			Expect(*getCluster().Spec.Replicas).To(Equal(int32(4)))
+		})
+
+		It("removes a node when idle, through the leave call, down to the minimum", func() {
+			autoscale()
+			idle := steadyLoad(0)
+
+			reconcileUsing(&fakeKahuna{membership: rosterOf(cluster, 4), metrics: idle})
+			reconcileUsing(&fakeKahuna{membership: rosterOf(cluster, 4), metrics: idle})
+			fake := reconcileUsing(&fakeKahuna{membership: rosterOf(cluster, 4), metrics: idle})
+
+			Expect(getCluster().Status.Autoscaling.DesiredReplicas).To(Equal(int32(3)))
+			Expect(fake.leaveCalls).To(HaveLen(1))
+			Expect(fake.leaveCalls[0]).To(ContainSubstring("10.244.0.4"))
+			Expect(*getSTS().Spec.Replicas).To(Equal(int32(3)))
+
+			reconcileUsing(&fakeKahuna{membership: rosterOf(cluster, 3), metrics: idle})
+			reconcileUsing(&fakeKahuna{membership: rosterOf(cluster, 3), metrics: idle})
+			Expect(getCluster().Status.Autoscaling.DesiredReplicas).To(Equal(int32(3)),
+				"scaled below minReplicas")
+		})
+
+		It("does not grow a fully replicated cluster past the replication cap", func() {
+			obj := getCluster()
+			obj.Spec.Replication = &kahunav1alpha1.ReplicationSpec{Factor: 3}
+			obj.Spec.Autoscaling = &kahunav1alpha1.AutoscalingSpec{
+				MinReplicas: 3, MaxReplicas: 6,
+				TargetWritesPerSecond:       ptr.To(int32(1000)),
+				ScaleUpStabilizationSeconds: ptr.To(int32(0)),
+			}
+			Expect(k8sClient.Update(ctx, obj)).To(Succeed())
+
+			// Founded at 3 nodes with factor 3: the server left every data partition without a
+			// replica set, so each node added would be one more copy of everything.
+			full := &kahuna.Placement{ReplicationFactor: 3, Initialized: true, Partitions: []kahuna.PartitionPlacement{
+				{PartitionID: 1, State: kahuna.PartitionStateActive}, {PartitionID: 2, State: kahuna.PartitionStateActive},
+			}}
+			load := steadyLoad(5000)
+			for range 4 {
+				reconcileUsing(&fakeKahuna{membership: rosterOf(cluster, 3), metrics: load, placement: full})
+			}
+
+			out := getCluster()
+			Expect(out.Status.Autoscaling.DesiredReplicas).To(Equal(int32(3)))
+			Expect(*getSTS().Spec.Replicas).To(Equal(int32(3)))
+			limited := apimeta.FindStatusCondition(out.Status.Conditions, kahunav1alpha1.ConditionAutoscalingLimited)
+			Expect(limited).NotTo(BeNil())
+			Expect(limited.Status).To(Equal(metav1.ConditionTrue))
+			Expect(limited.Message).To(ContainSubstring("fully replicated"))
+		})
+
+		It("holds and says why when the metrics endpoint is missing", func() {
+			autoscale()
+			for range 3 {
+				reconcileUsing(&fakeKahuna{membership: rosterOf(cluster, 4)})
+			}
+			out := getCluster()
+			Expect(out.Status.Autoscaling.DesiredReplicas).To(Equal(int32(4)))
+			limited := apimeta.FindStatusCondition(out.Status.Conditions, kahunav1alpha1.ConditionAutoscalingLimited)
+			Expect(limited).NotTo(BeNil())
+			Expect(limited.Message).To(ContainSubstring("traffic metrics could not be read"))
+		})
+
+		It("rejects autoscaling without a replication factor", func() {
+			obj := getCluster()
+			obj.Spec.Autoscaling = &kahunav1alpha1.AutoscalingSpec{
+				MinReplicas: 3, MaxReplicas: 6, TargetWritesPerSecond: ptr.To(int32(1000)),
+			}
+			err := k8sClient.Update(ctx, obj)
+			Expect(err).To(HaveOccurred())
+			Expect(err.Error()).To(ContainSubstring("autoscaling requires spec.replication"))
+		})
+
+		It("rejects a factor above 3 and a minimum below 3", func() {
+			obj := getCluster()
+			obj.Spec.Replication = &kahunav1alpha1.ReplicationSpec{Factor: 5}
+			Expect(k8sClient.Update(ctx, obj)).NotTo(Succeed())
+
+			obj = getCluster()
+			obj.Spec.Replication = &kahunav1alpha1.ReplicationSpec{Factor: 3}
+			obj.Spec.Autoscaling = &kahunav1alpha1.AutoscalingSpec{
+				MinReplicas: 1, MaxReplicas: 6, TargetWritesPerSecond: ptr.To(int32(1000)),
+			}
+			Expect(k8sClient.Update(ctx, obj)).NotTo(Succeed())
+		})
 	})
 
 	It("pins the bootstrap size so a later scale does not change who founds the cluster", func() {

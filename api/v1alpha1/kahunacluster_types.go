@@ -62,6 +62,9 @@ const (
 	ConditionRosterConverged = "RosterConverged"
 	// ConditionDegraded is true when the cluster cannot reach or hold its desired state.
 	ConditionDegraded = "Degraded"
+	// ConditionAutoscalingLimited is true when the autoscaler wants a size it is not allowed to
+	// reach: a bound, an unreadable signal, or a replication factor the cluster cannot yet honour.
+	ConditionAutoscalingLimited = "AutoscalingLimited"
 )
 
 // PVCRetentionPolicy controls what happens to a node's PersistentVolumeClaims when its pod is
@@ -368,6 +371,81 @@ type WorkersSpec struct {
 	BackgroundWriter *int32 `json:"backgroundWriter,omitempty"`
 }
 
+// ReplicationSpec caps how many nodes hold each data partition.
+//
+// Without it every node holds every partition, so each node added is one more copy of all the
+// data and one more voter on every write — the cluster gets more expensive without getting more
+// write capacity. With it each partition lives on `factor` nodes and the placement rebalancer
+// spreads the partitions across the rest.
+type ReplicationSpec struct {
+	// factor is the number of voter replicas of each data partition (--raft-replication-factor).
+	// The system partition always spans every node regardless.
+	//
+	// The server applies the factor only to partitions created while the cluster has more nodes
+	// than the factor, and it never converts a fully replicated partition afterwards. A cluster
+	// created with 3 nodes and factor 3 therefore stays fully replicated; create it with at least
+	// 4 nodes to get real placement.
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:validation:Maximum=3
+	// +required
+	Factor int32 `json:"factor"`
+}
+
+// AutoscalingSpec lets the operator choose the node count from traffic.
+//
+// The operator steps one node at a time, and only once the roster has converged on the previous
+// step, so a scale never stacks a second membership change on top of one still in flight. A
+// signal must stay past its target for the whole stabilization window before a step is taken.
+// +kubebuilder:validation:XValidation:rule="self.maxReplicas >= self.minReplicas",message="autoscaling.maxReplicas must be >= autoscaling.minReplicas"
+// +kubebuilder:validation:XValidation:rule="has(self.targetWritesPerSecond) || has(self.targetQueueDepth)",message="autoscaling needs at least one of targetWritesPerSecond or targetQueueDepth"
+type AutoscalingSpec struct {
+	// minReplicas is the floor. It must be at least 3: one node runs in standalone mode and cannot
+	// grow, and two nodes tolerate no failures.
+	// +kubebuilder:validation:Minimum=3
+	// +required
+	MinReplicas int32 `json:"minReplicas"`
+
+	// maxReplicas is the ceiling.
+	// +kubebuilder:validation:Minimum=3
+	// +required
+	MaxReplicas int32 `json:"maxReplicas"`
+
+	// targetWritesPerSecond is the direct key/value write rate each node should carry on average
+	// (kahuna.kv.write.admitted). Transactional writes are not counted by that metric; use
+	// targetQueueDepth to cover them.
+	// +kubebuilder:validation:Minimum=1
+	// +optional
+	TargetWritesPerSecond *int32 `json:"targetWritesPerSecond,omitempty"`
+
+	// targetQueueDepth is the number of client proposals each node should have waiting on average
+	// across its partition executors (raft.executor.client_queue_depth). It reflects pressure from
+	// every kind of write.
+	// +kubebuilder:validation:Minimum=1
+	// +optional
+	TargetQueueDepth *int32 `json:"targetQueueDepth,omitempty"`
+
+	// scaleUpStabilizationSeconds is how long load must stay above target before a node is added.
+	// +kubebuilder:default=60
+	// +kubebuilder:validation:Minimum=0
+	// +optional
+	ScaleUpStabilizationSeconds *int32 `json:"scaleUpStabilizationSeconds,omitempty"`
+
+	// scaleDownStabilizationSeconds is how long load must stay below target before a node is
+	// removed. Longer than the scale-up window on purpose: a removal costs a drain and a later
+	// re-add costs a catch-up, so flapping is expensive.
+	// +kubebuilder:default=300
+	// +kubebuilder:validation:Minimum=0
+	// +optional
+	ScaleDownStabilizationSeconds *int32 `json:"scaleDownStabilizationSeconds,omitempty"`
+
+	// tolerancePercent is the dead band around the target inside which no step is recommended.
+	// +kubebuilder:default=10
+	// +kubebuilder:validation:Minimum=0
+	// +kubebuilder:validation:Maximum=100
+	// +optional
+	TolerancePercent *int32 `json:"tolerancePercent,omitempty"`
+}
+
 // KahunaClusterSpec defines the desired state of a Kahuna cluster.
 type KahunaClusterSpec struct {
 	// replicas is the number of Kahuna nodes. Raft needs an odd count for a clean majority;
@@ -380,10 +458,21 @@ type KahunaClusterSpec struct {
 	// quorum model and a different on-disk identity. It is fine for development, but a
 	// single-node cluster cannot later be grown into a real one, which is why growing away from
 	// 1 is rejected below rather than silently corrupting the node's state.
+	//
+	// When autoscaling is set, replicas is only the starting size (clamped to the autoscaling
+	// bounds); after that the autoscaler owns the node count and edits here are ignored.
 	// +kubebuilder:default=3
 	// +kubebuilder:validation:Minimum=1
 	// +optional
 	Replicas *int32 `json:"replicas,omitempty"`
+
+	// replication caps how many nodes hold each data partition. Required for autoscaling.
+	// +optional
+	Replication *ReplicationSpec `json:"replication,omitempty"`
+
+	// autoscaling lets the operator add and remove nodes with traffic.
+	// +optional
+	Autoscaling *AutoscalingSpec `json:"autoscaling,omitempty"`
 
 	// image is the Kahuna server image. The operator overrides the image entrypoint with its own
 	// generated startup script, so the stock single-node image works unmodified.
@@ -392,7 +481,7 @@ type KahunaClusterSpec struct {
 	// image moves on its own re-rolls every node on a registry push, and the generated command
 	// line is version-specific: a flag the new server no longer accepts stops the node at
 	// startup. Raise this default deliberately, once the flags are checked against that release.
-	// +kubebuilder:default="kahunakv/kahuna:1.8.1"
+	// +kubebuilder:default="kahunakv/kahuna:1.12.2"
 	// +optional
 	Image string `json:"image,omitempty"`
 
@@ -529,6 +618,43 @@ type MemberStatus struct {
 	Ready bool `json:"ready,omitempty"`
 }
 
+// AutoscalingStatus is the autoscaler's memory between reconciles. It lives in status rather than in
+// the operator's process so a restart of the operator does not reset a stabilization window or forget
+// the size it chose.
+type AutoscalingStatus struct {
+	// desiredReplicas is the node count the autoscaler has chosen. It replaces spec.replicas as the
+	// target while autoscaling is enabled.
+	// +optional
+	DesiredReplicas int32 `json:"desiredReplicas,omitempty"`
+
+	// recommendedReplicas is what the latest signals ask for, before bounds, stabilization and the
+	// one-node-at-a-time rule are applied.
+	// +optional
+	RecommendedReplicas int32 `json:"recommendedReplicas,omitempty"`
+
+	// writesPerSecondPerNode is the latest measured average direct write rate per node.
+	// +optional
+	WritesPerSecondPerNode *int64 `json:"writesPerSecondPerNode,omitempty"`
+
+	// queueDepthPerNode is the latest measured average client queue depth per node.
+	// +optional
+	QueueDepthPerNode *int64 `json:"queueDepthPerNode,omitempty"`
+
+	// aboveTargetSince is when the recommendation first rose above desiredReplicas without
+	// interruption. Cleared whenever it drops back or a step is taken.
+	// +optional
+	AboveTargetSince *metav1.Time `json:"aboveTargetSince,omitempty"`
+
+	// belowTargetSince is when the recommendation first fell below desiredReplicas without
+	// interruption. Cleared whenever it rises back or a step is taken.
+	// +optional
+	BelowTargetSince *metav1.Time `json:"belowTargetSince,omitempty"`
+
+	// lastScaleTime is when the autoscaler last changed desiredReplicas.
+	// +optional
+	LastScaleTime *metav1.Time `json:"lastScaleTime,omitempty"`
+}
+
 // KahunaClusterStatus defines the observed state of a Kahuna cluster.
 type KahunaClusterStatus struct {
 	// observedGeneration is the spec generation this status reflects.
@@ -590,6 +716,10 @@ type KahunaClusterStatus struct {
 	// +optional
 	UpdatePartition *int32 `json:"updatePartition,omitempty"`
 
+	// autoscaling is the autoscaler's state. Present only while spec.autoscaling is set.
+	// +optional
+	Autoscaling *AutoscalingStatus `json:"autoscaling,omitempty"`
+
 	// conditions represent the current state of the KahunaCluster resource.
 	// +listType=map
 	// +listMapKey=type
@@ -602,8 +732,10 @@ type KahunaClusterStatus struct {
 // +kubebuilder:subresource:scale:specpath=.spec.replicas,statuspath=.status.replicas,selectorpath=.status.labelSelector
 // +kubebuilder:validation:XValidation:rule="self.spec.replicas != 2",message="replicas must not be 2: a two-Voter Raft cluster has a quorum of 2 and therefore tolerates no failures; use 1 or 3"
 // +kubebuilder:validation:XValidation:rule="(oldSelf.spec.replicas == 1) == (self.spec.replicas == 1)",message="a single-node (standalone) cluster cannot be scaled into a multi-node cluster, or vice versa: the two use different quorum models and on-disk identities. Create a new KahunaCluster and migrate the data."
+// +kubebuilder:validation:XValidation:rule="!has(self.spec.autoscaling) || has(self.spec.replication)",message="autoscaling requires spec.replication: without a replication factor every node holds every partition, so adding nodes adds copies rather than capacity"
 // +kubebuilder:resource:shortName=kahuna;kc
 // +kubebuilder:printcolumn:name="Desired",type=integer,JSONPath=`.spec.replicas`
+// +kubebuilder:printcolumn:name="Autoscaled",type=integer,JSONPath=`.status.autoscaling.desiredReplicas`
 // +kubebuilder:printcolumn:name="Ready",type=integer,JSONPath=`.status.readyReplicas`
 // +kubebuilder:printcolumn:name="Voters",type=integer,JSONPath=`.status.voters`
 // +kubebuilder:printcolumn:name="Roster",type=integer,JSONPath=`.status.membershipVersion`,priority=1

@@ -61,8 +61,9 @@ const requeueSteady = 60 * time.Second
 //
 // Running them in parallel is safe. Each object's reconcile touches only the resources it owns,
 // which are named after that cluster and therefore disjoint, and it writes only its own status.
-// The reconciler itself carries no mutable shared state: the Kubernetes client and the Kahuna
-// HTTP client are both safe for concurrent use, and the Scheme is read-only after setup.
+// The reconciler's shared state is safe for concurrent use: the Kubernetes client and the Kahuna
+// HTTP client are, the Scheme is read-only after setup, and the autoscaler's traffic sampler is
+// mutex-guarded and keyed by cluster, so two clusters never touch each other's samples.
 //
 // Reconciles of the SAME object are still serialized by controller-runtime's per-key workqueue,
 // which is what keeps a one-node-at-a-time membership change one-at-a-time.
@@ -77,6 +78,9 @@ type KahunaClusterReconciler struct {
 	// authoritative record of who is a member: a Running pod need not be one, and a roster entry
 	// can outlive the pod that created it.
 	Kahuna kahuna.Client
+
+	// traffic turns the cluster's cumulative counters into rates for the autoscaler.
+	traffic trafficSampler
 }
 
 // +kubebuilder:rbac:groups=kahuna.kahunakv.io,resources=kahunaclusters,verbs=get;list;watch;create;update;patch;delete
@@ -97,6 +101,9 @@ func (r *KahunaClusterReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 
 	cluster := &kahunav1alpha1.KahunaCluster{}
 	if err := r.Get(ctx, req.NamespacedName, cluster); err != nil {
+		if apierrors.IsNotFound(err) {
+			r.traffic.forget(req.NamespacedName)
+		}
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
 
@@ -147,12 +154,21 @@ func (r *KahunaClusterReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		log.V(1).Info("could not read cluster membership", "error", membershipErr)
 	}
 
+	// The autoscaler edits cluster.Status in memory, so the stored status is captured first: it is
+	// what the status write has to be compared against, or an autoscaler-only change would look
+	// like no change and never be persisted.
+	persisted := cluster.Status.DeepCopy()
+
+	// The autoscaler runs before the StatefulSet is sized because it is what decides the size:
+	// everything below reads the target through desiredReplicas, which consults the state set here.
+	r.reconcileAutoscaling(ctx, cluster, bootstrapped, membership, pods)
+
 	sts, err := r.reconcileStatefulSet(ctx, cluster, bootstrapped, membership, pods)
 	if err != nil {
 		return ctrl.Result{}, fmt.Errorf("reconciling stateful set: %w", err)
 	}
 
-	result, err := r.reconcileStatus(ctx, cluster, sts, pods, membership)
+	result, err := r.reconcileStatus(ctx, cluster, persisted, sts, pods, membership)
 	if err != nil {
 		return ctrl.Result{}, fmt.Errorf("updating status: %w", err)
 	}
@@ -279,8 +295,8 @@ func (r *KahunaClusterReconciler) reconcileStatefulSet(ctx context.Context, clus
 }
 
 // reconcileStatus recomputes status from the StatefulSet, the pods behind it, and the committed
-// Raft roster.
-func (r *KahunaClusterReconciler) reconcileStatus(ctx context.Context, cluster *kahunav1alpha1.KahunaCluster, sts *appsv1.StatefulSet, pods []corev1.Pod, membership *kahuna.Membership) (ctrl.Result, error) {
+// Raft roster. persisted is the status as stored, which decides whether a write is needed.
+func (r *KahunaClusterReconciler) reconcileStatus(ctx context.Context, cluster *kahunav1alpha1.KahunaCluster, persisted *kahunav1alpha1.KahunaClusterStatus, sts *appsv1.StatefulSet, pods []corev1.Pod, membership *kahuna.Membership) (ctrl.Result, error) {
 	desired := desiredReplicas(cluster)
 
 	current := &appsv1.StatefulSet{}
@@ -357,7 +373,7 @@ func (r *KahunaClusterReconciler) reconcileStatus(ctx context.Context, cluster *
 		"QuorumReady", "QuorumLost",
 		fmt.Sprintf("%d of %d nodes ready", status.ReadyReplicas, desired))
 
-	if !equalStatus(&cluster.Status, status) {
+	if !equalStatus(persisted, status) {
 		cluster.Status = *status
 		if err := r.Status().Update(ctx, cluster); err != nil {
 			return ctrl.Result{}, err
@@ -366,6 +382,11 @@ func (r *KahunaClusterReconciler) reconcileStatus(ctx context.Context, cluster *
 
 	if progressing || status.Replicas != desired {
 		return ctrl.Result{RequeueAfter: requeueProgressing}, nil
+	}
+	if cluster.Spec.Autoscaling != nil {
+		// Traffic changes without any object changing, so an autoscaled cluster is sampled on a
+		// timer; the steady interval would let a load spike run for a minute unnoticed.
+		return ctrl.Result{RequeueAfter: requeueAutoscaling}, nil
 	}
 	return ctrl.Result{RequeueAfter: requeueSteady}, nil
 }

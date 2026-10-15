@@ -91,6 +91,36 @@ func TestReadsAreBoundByTheReadTimeout(t *testing.T) {
 	}
 }
 
+// The autoscaler's reads carry the same bound. It polls them on every pass, so an unbounded one
+// would let a single unresponsive node stall the cluster's reconcile indefinitely.
+func TestAutoscalerReadsAreBoundByTheReadTimeout(t *testing.T) {
+	calls := map[string]func(*HTTPClient, string) error{
+		"/v1/cluster/placement": func(c *HTTPClient, url string) error {
+			_, err := c.Placement(context.Background(), url)
+			return err
+		},
+		"/v1/dashboard/metrics": func(c *HTTPClient, url string) error {
+			_, err := c.Metrics(context.Background(), url)
+			return err
+		},
+	}
+	for path, call := range calls {
+		t.Run(path, func(t *testing.T) {
+			srv := delayedServer(t, path, `{}`, testServerDelay)
+			c := NewHTTPClient(testReadTimeout, testLeaveTimeout)
+
+			start := time.Now()
+			if err := call(c, srv.URL); err == nil {
+				t.Fatalf("%s succeeded although the server answered after the read bound", path)
+			}
+			if elapsed := time.Since(start); elapsed >= testServerDelay {
+				t.Errorf("%s waited %v, which is at least the server delay %v; the read bound did not apply",
+					path, elapsed, testServerDelay)
+			}
+		})
+	}
+}
+
 // A leave bound of zero means "no bound of our own", leaving the caller's context as the only
 // limit. Without that, a zero value would read as an instant deadline and fail every call.
 func TestZeroLeaveTimeoutDefersToTheCallerContext(t *testing.T) {

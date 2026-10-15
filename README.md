@@ -1,4 +1,4 @@
-# Kahuna Kubernetes Operator
+# Kahuna Kubernetes Operator (Alpha)
 
 A Kubernetes operator for [Kahuna](https://github.com/kahunakv/kahuna) — a distributed key/value
 store, lock manager and sequencer built on Raft consensus.
@@ -37,6 +37,7 @@ kahuna   3         3       3        Running   12m
 | **Provisions** | Headless peer Service, client Service, per-node PVCs, ConfigMap, PodDisruptionBudget, StatefulSet. |
 | **Bootstraps** | Brings up all founding nodes at once so they can form their first quorum, and reports `Running` only when the committed roster carries every node as a Voter. |
 | **Scales** | One node at a time, in both directions, each step gated on the roster — never on what Kubernetes merely believes. Departing nodes are decommissioned through the cluster's leave API before their pods are removed. |
+| **Autoscales** | Optional. Adds and removes nodes with write traffic between a minimum and a maximum, one node at a time, and never grows a cluster in a way that would put more than 3 copies on any data partition. |
 | **Upgrades** | Rolling restarts one node at a time, held back automatically whenever the roster is not converged or unreadable. |
 | **Reports** | `status.members` mirrors the committed roster joined to the pods serving it, plus `Available` / `Progressing` / `RosterConverged` conditions. |
 
@@ -112,6 +113,53 @@ spec:
 
 Changing configuration rolls the cluster; changing `replicas` does not.
 
+## Autoscaling
+
+```yaml
+spec:
+  replicas: 4            # starting size only, once autoscaling is on
+  replication:
+    factor: 3            # at most 3 copies of each data partition (1-3)
+  autoscaling:
+    minReplicas: 3
+    maxReplicas: 9
+    targetWritesPerSecond: 2000   # direct writes per node
+    targetQueueDepth: 32          # pending client proposals per node
+    # scaleUpStabilizationSeconds: 60
+    # scaleDownStabilizationSeconds: 300
+    # tolerancePercent: 10
+```
+
+The operator polls `GET /v1/dashboard/metrics` on every ready node and turns
+`kahuna.kv.write.admitted` into a write rate and `raft.executor.client_queue_depth` into a queue
+depth, both averaged per node. The recommendation is the HorizontalPodAutoscaler's rule — current
+size times the worst signal's ratio to its target, with a dead band — but a step is **one node**,
+taken only after the recommendation has held for the whole stabilization window and only once the
+roster has converged on the previous step. Removal goes through the same leave-then-delete path as a
+manual scale-down.
+
+What the autoscaler chose lives in `status.autoscaling` (`desiredReplicas`, `recommendedReplicas`,
+the measured signals and the window timestamps), and `spec.replicas` is ignored after the first
+pass. Removing `spec.autoscaling` hands the count back to `spec.replicas`.
+
+**Why `replication` is required.** Without a replication factor every node holds every partition,
+so a node added is one more copy of all data and one more voter on every write: more cost, no more
+write capacity. With `factor: 3` the operator passes `--raft-replication-factor 3` and
+`--raft-enable-placement-rebalancer`; the rebalancer is what gives a newly added node any data at all.
+
+**Create the cluster with more nodes than the factor.** The server places a partition only if it is
+created while the cluster has more nodes than the factor, and it never converts a fully replicated
+partition later. A cluster founded at 3 nodes with factor 3 therefore stays fully replicated
+forever. The operator checks `GET /v1/cluster/placement` before every scale-up and refuses to grow
+such a cluster past 3 nodes, reporting why in the `AutoscalingLimited` condition. Founding at 4 or
+more is the workaround until the server can convert existing partitions.
+
+**Signals are never guessed.** The autoscaler holds — and says so in `AutoscalingLimited` — when any
+ready node's metrics cannot be read (including `--disable-dashboard` in `extraArgs`), and it never
+scales down on a partial view, since the missing node may be the leader carrying the load.
+`kahuna.kv.write.admitted` counts direct writes only; transactional writes show up through the queue
+depth signal.
+
 ## TLS
 
 TLS is not optional for a multi-node cluster: the Raft port is an HTTPS listener and inter-node gRPC
@@ -163,7 +211,7 @@ needs. Set it to `false` when the issuer's CA is in the image's trust store.
 - Kahuna's command-line parser rejects an option it does not define rather than ignoring it, so an
   older server fails at startup on that same flag.
 
-`spec.image` therefore defaults to an exact tag, `kahunakv/kahuna:1.8.1`, rather than to `latest`.
+`spec.image` therefore defaults to an exact tag, `kahunakv/kahuna:1.12.2`, rather than to `latest`.
 A floating tag re-rolls a running cluster on a registry push, and the generated command line is
 version-specific. Raise the tag deliberately, after checking the flags against that release.
 
@@ -207,7 +255,13 @@ entrypoint with its own generated startup script.
 - **A node rejoining after a long absence can hit the Raft compaction floor.** If the cluster has
   discarded the log the node needs, catch-up cannot complete; seed it from a recent backup first.
   See the [cluster membership operations guide](https://github.com/kahunakv/kahuna/blob/main/docs/cluster-membership-operations-guide.md), §8.
-- **No metrics.** Kahuna emits no application metrics today, so there is no ServiceMonitor to ship.
+- **No Prometheus endpoint.** Kahuna exposes its metrics only as JSON on `/v1/dashboard/metrics`,
+  which the autoscaler reads, so there is no ServiceMonitor to ship.
+- **New nodes catch up through Raft, not from a backup.** A node added by a scale-up joins empty and
+  the leader ships it a snapshot plus the log tail. Seeding it from the latest full/incremental
+  backup in GCS instead needs two server changes first: the stock server registering the GCS
+  backup provider, and `--pitr-bootstrap-from` downloading the full backup's checkpoint itself
+  (today it assumes the checkpoint is already on disk).
 - **`nodeId` reads 0 for founding roster members.** Kommander seeds the initial roster from
   discovery, which yields endpoints but not node ids, so peers are recorded with a provisional 0
   that a later Join RPC would replace — and a founding node never sends one
@@ -218,6 +272,8 @@ entrypoint with its own generated startup script.
 ## Not yet implemented
 
 - Backup/restore CRDs over the existing `/v1/backups/*` endpoints
+- Scheduled coordinated backups to GCS, and seeding scale-up nodes from them (blocked on the two
+  server changes listed under *Known gaps*)
 
 ## Verified
 

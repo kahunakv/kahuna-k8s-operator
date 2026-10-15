@@ -42,11 +42,11 @@ var (
 	// image push must not turn an unrelated pull request red. Override it to test a locally built
 	// server, or bump it deliberately to pick up a new release.
 	//
-	// 1.8.1 is also the operator's floor, not merely its current choice. The generated command
-	// line passes --allow-plaintext-listener, which older servers do not define, and Kahuna's
-	// parser rejects an option it does not know rather than ignoring it. An earlier tag here
-	// fails every node at startup.
-	kahunaImage = envOr("KAHUNA_IMAGE", "kahunakv/kahuna:1.8.1")
+	// Do not go below 1.8.1, the operator's floor. The generated command line passes
+	// --allow-plaintext-listener, which older servers do not define, and Kahuna's parser rejects
+	// an option it does not know rather than ignoring it. A tag older than 1.8.1 here fails every
+	// node at startup.
+	kahunaImage = envOr("KAHUNA_IMAGE", "kahunakv/kahuna:1.12.2")
 )
 
 // envOr reads an environment variable with a fallback.

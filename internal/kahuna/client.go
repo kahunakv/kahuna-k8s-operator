@@ -120,6 +120,98 @@ func (l *LeaveResult) Removed() bool {
 	return l.Outcome == OutcomeCommitted || l.Outcome == OutcomeNotAMember
 }
 
+// PartitionStateActive is the state of a partition that serves traffic, as reported by
+// GET /v1/cluster/placement.
+const PartitionStateActive = "Active"
+
+// ReplicaPlacement is one replica of a partition as GET /v1/cluster/placement reports it.
+type ReplicaPlacement struct {
+	Endpoint string `json:"endpoint"`
+	Role     string `json:"role"`
+}
+
+// PartitionPlacement is one partition's committed replica set. An empty Replicas list means legacy
+// full replication: every roster Voter hosts the partition.
+type PartitionPlacement struct {
+	PartitionID                int32              `json:"partitionId"`
+	State                      string             `json:"state"`
+	EffectiveReplicationFactor int32              `json:"effectiveReplicationFactor"`
+	Replicas                   []ReplicaPlacement `json:"replicas"`
+}
+
+// Placement is the response of GET /v1/cluster/placement.
+type Placement struct {
+	ReplicationFactor int32                `json:"replicationFactor"`
+	RebalancerEnabled bool                 `json:"rebalancerEnabled"`
+	Initialized       bool                 `json:"initialized"`
+	Partitions        []PartitionPlacement `json:"partitions"`
+}
+
+// FullyReplicated returns the active data partitions that have no replica set. Under a replication
+// factor these are the partitions that grow by one copy for every node added, because the server
+// never converts them to placed ranges.
+func (p *Placement) FullyReplicated() []int32 {
+	var out []int32
+	for _, part := range p.Partitions {
+		// Partition 0 is the system partition, which always spans every node by design.
+		if part.PartitionID > 0 && part.State == PartitionStateActive && len(part.Replicas) == 0 {
+			out = append(out, part.PartitionID)
+		}
+	}
+	return out
+}
+
+// Metric kinds reported by GET /v1/dashboard/metrics.
+const (
+	MetricKindCounter = "Counter"
+	MetricKindGauge   = "Gauge"
+)
+
+// MetricRow is one instrument-and-tag-set row of GET /v1/dashboard/metrics. Counters carry their
+// cumulative sum in Total; gauges carry the sampled value in Last.
+type MetricRow struct {
+	Metric string   `json:"metric"`
+	Tags   string   `json:"tags"`
+	Kind   string   `json:"kind"`
+	Count  int64    `json:"count"`
+	Total  *float64 `json:"total"`
+	Last   *float64 `json:"last"`
+}
+
+// Metrics is the response of GET /v1/dashboard/metrics.
+type Metrics struct {
+	Rows []MetricRow `json:"rows"`
+	// MonotonicMs is the node's monotonic clock at sampling time. Rates are computed against it
+	// rather than the operator's clock, so request latency does not distort them.
+	MonotonicMs int64 `json:"monotonicMs"`
+}
+
+// CounterTotal sums a counter across every tag set.
+func (m *Metrics) CounterTotal(metric string) (float64, bool) {
+	var sum float64
+	found := false
+	for _, r := range m.Rows {
+		if r.Metric == metric && r.Kind == MetricKindCounter && r.Total != nil {
+			sum += *r.Total
+			found = true
+		}
+	}
+	return sum, found
+}
+
+// GaugeSum sums a gauge's latest value across every tag set.
+func (m *Metrics) GaugeSum(metric string) (float64, bool) {
+	var sum float64
+	found := false
+	for _, r := range m.Rows {
+		if r.Metric == metric && r.Kind == MetricKindGauge && r.Last != nil {
+			sum += *r.Last
+			found = true
+		}
+	}
+	return sum, found
+}
+
 // Client reads cluster state from a Kahuna node, and asks one to decommission itself.
 type Client interface {
 	// Membership returns the committed roster as seen by the node at baseURL.
@@ -132,6 +224,11 @@ type Client interface {
 	// tell "the node is out" from "nothing happened" — and only a transport failure is genuinely
 	// unclassifiable.
 	Leave(ctx context.Context, baseURL string) (*LeaveResult, error)
+	// Placement returns the committed replica set of every partition, as seen by the node.
+	Placement(ctx context.Context, baseURL string) (*Placement, error)
+	// Metrics returns the node's curated engine metrics. The endpoint does not exist when the
+	// server runs with --disable-dashboard, which callers must treat as "signal unknown".
+	Metrics(ctx context.Context, baseURL string) (*Metrics, error)
 }
 
 // Default timeouts. A status read and a leave need different bounds, and one value cannot serve
@@ -155,8 +252,9 @@ const (
 // query that never leaves the cluster network.
 type HTTPClient struct {
 	HTTP *http.Client
-	// ReadTimeout bounds Membership and Health. It stays short: a status read must never wedge a
-	// reconcile, and an unreachable node is reported as an unknown roster rather than an error.
+	// ReadTimeout bounds Membership, Health, Placement and Metrics. It stays short: a status read
+	// must never wedge a reconcile, and an unreachable node is reported as an unknown roster rather
+	// than an error.
 	ReadTimeout time.Duration
 	// LeaveTimeout bounds Leave, which is not a status read and must not carry a read bound.
 	LeaveTimeout time.Duration
@@ -234,6 +332,38 @@ func (c *HTTPClient) Health(ctx context.Context, baseURL string) (*Health, error
 		return nil, fmt.Errorf("health query returned HTTP %d", code)
 	}
 	return &h, nil
+}
+
+// Placement implements Client.
+func (c *HTTPClient) Placement(ctx context.Context, baseURL string) (*Placement, error) {
+	ctx, cancel := bound(ctx, c.ReadTimeout)
+	defer cancel()
+
+	var p Placement
+	code, err := c.get(ctx, baseURL+"/v1/cluster/placement", &p)
+	if err != nil {
+		return nil, err
+	}
+	if code != http.StatusOK {
+		return nil, fmt.Errorf("placement query returned HTTP %d", code)
+	}
+	return &p, nil
+}
+
+// Metrics implements Client.
+func (c *HTTPClient) Metrics(ctx context.Context, baseURL string) (*Metrics, error) {
+	ctx, cancel := bound(ctx, c.ReadTimeout)
+	defer cancel()
+
+	var m Metrics
+	code, err := c.get(ctx, baseURL+"/v1/dashboard/metrics", &m)
+	if err != nil {
+		return nil, err
+	}
+	if code != http.StatusOK {
+		return nil, fmt.Errorf("metrics query returned HTTP %d", code)
+	}
+	return &m, nil
 }
 
 // Leave implements Client.
