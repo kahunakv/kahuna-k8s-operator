@@ -62,9 +62,24 @@ func (f *fakeKahuna) Placement(context.Context, string) (*kahuna.Placement, erro
 	if f.placement != nil {
 		return f.placement, nil
 	}
-	return &kahuna.Placement{ReplicationFactor: 3, Initialized: true, Partitions: []kahuna.PartitionPlacement{
-		{PartitionID: 1, State: kahuna.PartitionStateActive, Replicas: []kahuna.ReplicaPlacement{{Endpoint: "a"}, {Endpoint: "b"}, {Endpoint: "c"}}},
-	}}, nil
+	// A settled placement for the roster being served: six data partitions, three Voter replicas
+	// each, spread round-robin so every member carries a share — what a cluster looks like once
+	// the rebalancer has finished with it.
+	p := &kahuna.Placement{ReplicationFactor: 3, Initialized: true}
+	if f.membership == nil || len(f.membership.Members) < 3 {
+		return p, nil
+	}
+	n := len(f.membership.Members)
+	for id := int32(1); id <= 6; id++ {
+		part := kahuna.PartitionPlacement{PartitionID: id, State: kahuna.PartitionStateActive, EffectiveReplicationFactor: 3}
+		for j := range 3 {
+			part.Replicas = append(part.Replicas, kahuna.ReplicaPlacement{
+				Endpoint: f.membership.Members[(int(id)+j)%n].Endpoint, Role: "Voter",
+			})
+		}
+		p.Partitions = append(p.Partitions, part)
+	}
+	return p, nil
 }
 
 func (f *fakeKahuna) Metrics(_ context.Context, baseURL string) (*kahuna.Metrics, error) {
@@ -535,6 +550,35 @@ var _ = Describe("KahunaCluster Controller", func() {
 			reconcileUsing(&fakeKahuna{membership: rosterOf(cluster, 3), metrics: idle})
 			Expect(getCluster().Status.Autoscaling.DesiredReplicas).To(Equal(int32(3)),
 				"scaled below minReplicas")
+		})
+
+		It("waits for the data to follow a step before taking the next one", func() {
+			autoscale()
+			load := steadyLoad(5000)
+
+			reconcileUsing(&fakeKahuna{membership: rosterOf(cluster, 4), metrics: load})
+			reconcileUsing(&fakeKahuna{membership: rosterOf(cluster, 4), metrics: load})
+			reconcileUsing(&fakeKahuna{membership: rosterOf(cluster, 4), metrics: load})
+			Expect(getCluster().Status.Autoscaling.DesiredReplicas).To(Equal(int32(5)))
+
+			// The fifth node is a committed Voter and its pod is ready, but the rebalancer is still
+			// moving a replica onto it. The roster alone would call this converged.
+			moving := rosterOf(cluster, 5)
+			settled, _ := (&fakeKahuna{membership: moving}).Placement(ctx, "")
+			settled.Partitions[0].Replicas[0].Role = "Learner"
+			reconcileUsing(&fakeKahuna{membership: moving, metrics: load, placement: settled})
+			reconcileUsing(&fakeKahuna{membership: moving, metrics: load, placement: settled})
+			out := getCluster()
+			Expect(out.Status.Autoscaling.DesiredReplicas).To(Equal(int32(5)), "stacked a step on one whose data is still moving")
+			limited := apimeta.FindStatusCondition(out.Status.Conditions, kahunav1alpha1.ConditionAutoscalingLimited)
+			Expect(limited).NotTo(BeNil())
+			Expect(limited.Status).To(Equal(metav1.ConditionFalse), "a move in flight is not a limit")
+			Expect(limited.Message).To(ContainSubstring("replica moves in flight"))
+
+			// Once the move lands the step is complete and load may ask for the next node.
+			reconcileUsing(&fakeKahuna{membership: moving, metrics: load})
+			reconcileUsing(&fakeKahuna{membership: moving, metrics: load})
+			Expect(getCluster().Status.Autoscaling.DesiredReplicas).To(Equal(int32(6)))
 		})
 
 		It("does not regrow the cluster from a cached status the previous pass already moved", func() {

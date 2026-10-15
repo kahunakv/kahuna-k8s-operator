@@ -231,6 +231,90 @@ func TestSamplerComputesRatesAndSurvivesRestarts(t *testing.T) {
 	}
 }
 
+// placed builds a placement of the given data partitions, each a list of replicas.
+func placed(parts ...[]kahuna.ReplicaPlacement) *kahuna.Placement {
+	p := &kahuna.Placement{ReplicationFactor: 3, Initialized: true}
+	for i, reps := range parts {
+		p.Partitions = append(p.Partitions, kahuna.PartitionPlacement{
+			PartitionID: int32(i + 1), State: kahuna.PartitionStateActive, Replicas: reps,
+		})
+	}
+	return p
+}
+
+func voters(cluster *kahunav1alpha1.KahunaCluster, ordinals ...int32) []kahuna.ReplicaPlacement {
+	out := make([]kahuna.ReplicaPlacement, 0, len(ordinals))
+	for _, o := range ordinals {
+		out = append(out, kahuna.ReplicaPlacement{Endpoint: raftEndpoint(cluster, o), Role: "Voter"})
+	}
+	return out
+}
+
+func TestPlacementConvergedWaitsForMovesAndStrandedReplicas(t *testing.T) {
+	cluster := testCluster(4)
+
+	// Every node carries data, nothing moving: converged.
+	p := placed(voters(cluster, 0, 1, 2), voters(cluster, 1, 2, 3), voters(cluster, 2, 3, 0), voters(cluster, 3, 0, 1))
+	if ok, why := placementConverged(cluster, p, 4, t0, nil); !ok {
+		t.Fatalf("a settled placement was not converged: %s", why)
+	}
+
+	// A Learner is a move in flight, however long it has been going on.
+	moving := placed(voters(cluster, 0, 1, 2), voters(cluster, 1, 2, 3), voters(cluster, 2, 3, 0), voters(cluster, 3, 0, 1))
+	moving.Partitions[1].Replicas[2].Role = "Learner"
+	settleBy := t0.Add(-time.Hour)
+	if ok, why := placementConverged(cluster, moving, 4, t0, &settleBy); ok || why == "" {
+		t.Fatal("a replica move in flight was treated as converged")
+	}
+
+	// After a scale-down to 3, partition 2 still has a replica on the node that left.
+	if ok, why := placementConverged(cluster, p, 3, t0, &settleBy); ok || why == "" {
+		t.Fatal("a replica stranded on a departed node was treated as converged")
+	}
+
+	// Fully replicated partitions have no replica set and nothing to settle.
+	if ok, _ := placementConverged(cluster, placed(nil, nil), 4, t0, nil); !ok {
+		t.Fatal("fully replicated partitions blocked convergence")
+	}
+	// Three single-copy partitions on four nodes: one node is empty by arithmetic, not by delay.
+	sparse := placed(voters(cluster, 0), voters(cluster, 1), voters(cluster, 2))
+	if ok, why := placementConverged(cluster, sparse, 4, t0, nil); !ok {
+		t.Fatalf("waited for a share no node can be given: %s", why)
+	}
+}
+
+func TestPlacementConvergedWaitsForANodesShareUntilTheSettleTimeout(t *testing.T) {
+	cluster := testCluster(4)
+	// Node 3 just joined and holds nothing yet; the other three carry everything.
+	empty := placed(voters(cluster, 0, 1, 2), voters(cluster, 0, 1, 2), voters(cluster, 0, 1, 2), voters(cluster, 0, 1, 2))
+
+	if ok, why := placementConverged(cluster, empty, 4, t0, nil); ok || why == "" {
+		t.Fatal("an empty node was treated as carrying its share")
+	}
+	settleBy := t0.Add(placementSettleTimeout)
+	if ok, _ := placementConverged(cluster, empty, 4, t0.Add(time.Minute), &settleBy); ok {
+		t.Fatal("gave up on the node's share before the settle timeout")
+	}
+	if ok, _ := placementConverged(cluster, empty, 4, settleBy, &settleBy); !ok {
+		t.Fatal("still waiting on a share the planner may never deliver after the settle timeout")
+	}
+	// Half the even share is enough: 12 replicas over 4 nodes is 3 each, so 1 would be too few
+	// and 2 is carrying data.
+	some := placed(voters(cluster, 0, 1, 2), voters(cluster, 0, 1, 2), voters(cluster, 0, 1, 3), voters(cluster, 1, 2, 3))
+	if ok, why := placementConverged(cluster, some, 4, t0, nil); !ok {
+		t.Fatalf("a node with half its share was not converged: %s", why)
+	}
+}
+
+func TestAutoscaleClampRecordsAScaleTime(t *testing.T) {
+	spec := autoscaleSpec()
+	spec.MinReplicas = 5
+	d := decideAutoscale(autoscaleInput{spec: spec, prev: &kahunav1alpha1.AutoscalingStatus{DesiredReplicas: 4}, initial: 4, signal: writes(1000), converged: false, now: t0})
+	if d.status.DesiredReplicas != 5 || d.status.LastScaleTime == nil || !d.status.LastScaleTime.Time.Equal(t0) {
+		t.Fatalf("a bound edit that resized the cluster did not record when: %+v", d.status)
+	}
+}
+
 func TestPlacementFindsFullyReplicatedDataPartitions(t *testing.T) {
 	p := &kahuna.Placement{Partitions: []kahuna.PartitionPlacement{
 		// The system partition always spans every node; it is not a violation.

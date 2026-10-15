@@ -142,8 +142,13 @@ The operator polls `GET /v1/dashboard/metrics` on every ready node and turns
 depth, both averaged per node. The recommendation is the HorizontalPodAutoscaler's rule — current
 size times the worst signal's ratio to its target, with a dead band — but a step is **one node**,
 taken only after the recommendation has held for the whole stabilization window and only once the
-roster has converged on the previous step. Removal goes through the same leave-then-delete path as a
-manual scale-down.
+previous step is complete. Complete means more than the roster having converged: the operator also
+reads `GET /v1/cluster/placement` and waits until no replica move is in flight, no replica is left on
+a node that departed, and every node carries a share of the data partitions. The share is waited for
+at most five minutes after the step, because the server's planner stops at its own notion of even
+and a cluster with fewer placed replicas than nodes leaves one empty for good; the two other
+conditions are waited for as long as they hold. Removal goes through the same leave-then-delete
+path as a manual scale-down.
 
 What the autoscaler chose lives in `status.autoscaling` (`desiredReplicas`, `recommendedReplicas`,
 the measured signals and the window timestamps), and `spec.replicas` is ignored after the first
