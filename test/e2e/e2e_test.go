@@ -194,6 +194,34 @@ spec:
 `, clusterName, testNamespace, replicas, kahunaImage, extraArgs)
 }
 
+// dumpClusterState prints what a failed spec left behind: the KahunaCluster, its pods and
+// events, the pods' logs and the operator's. Each command's output is printed even when it fails,
+// since a half-torn-down namespace is exactly when the partial view is the useful one.
+func dumpClusterState() {
+	show := func(args ...string) {
+		out, err := kubectl(args...)
+		if err != nil {
+			out = err.Error()
+		}
+		_, _ = fmt.Fprintf(GinkgoWriter, "===== kubectl %s =====\n%s\n", strings.Join(args, " "), out)
+	}
+	show("-n", testNamespace, "get", "kahunacluster", clusterName, "-o", "yaml")
+	show("-n", testNamespace, "get", "pods,sts,svc,pvc,certificate", "-o", "wide")
+	show("-n", testNamespace, "get", "events", "--sort-by=.lastTimestamp")
+	show("-n", testNamespace, "describe", "pods")
+	pods, _ := kubectl("-n", testNamespace, "get", "pods", "-o", "name")
+	for _, pod := range strings.Fields(pods) {
+		show("-n", testNamespace, "logs", pod, "--all-containers", "--tail=200")
+		// A crash loop's cause is in the log of the attempt that died, not the one now starting.
+		restarts, _ := kubectl("-n", testNamespace, "get", pod, "-o",
+			"jsonpath={.status.containerStatuses[*].restartCount}")
+		if strings.ContainsFunc(restarts, func(r rune) bool { return r >= '1' && r <= '9' }) {
+			show("-n", testNamespace, "logs", pod, "--all-containers", "--previous", "--tail=100")
+		}
+	}
+	show("-n", operatorNamespace, "logs", "deployment/kahuna-operator-controller-manager", "--tail=300")
+}
+
 // expectConverged waits for the operator to report a converged cluster of the given size.
 func expectConverged(replicas int) {
 	EventuallyWithOffset(1, func() string {
@@ -243,7 +271,24 @@ spec:
 `, testNamespace))
 	})
 
+	// The specs are ordered, so one failure skips the rest and the container ends. Whether any
+	// spec failed is recorded here because AfterAll only sees the report of the last spec to run,
+	// which on a failure is a skipped one.
+	var failed bool
+	JustAfterEach(func() {
+		if CurrentSpecReport().Failed() {
+			failed = true
+		}
+	})
+
 	AfterAll(func() {
+		if failed {
+			// The namespace is the evidence. Deleting it here would leave CI's post-failure dump
+			// with nothing to show, and a local run with nothing to inspect.
+			By("keeping the test namespace for inspection because a spec failed")
+			dumpClusterState()
+			return
+		}
 		By("removing the test namespace")
 		_, _ = kubectl("delete", "namespace", testNamespace, "--wait=false")
 	})
