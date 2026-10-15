@@ -275,6 +275,17 @@ func TestReplicationFactorEnablesTheRebalancer(t *testing.T) {
 	if !hasFlag(args, "--raft-enable-placement-rebalancer") {
 		t.Fatal("the replication factor was set without the placement rebalancer")
 	}
+	// And with the server's default pacing it receives them too slowly to matter, then stops
+	// short of its share: the three settings travel together (see the entrypoint for why).
+	for flag, want := range map[string]string{
+		"--raft-max-concurrent-replica-transfers": "4",
+		"--raft-max-replica-moves-per-pass":       "8",
+		"--raft-replica-count-deadband":           "0",
+	} {
+		if got := argValues(args, flag); len(got) != 1 || got[0] != want {
+			t.Errorf("%s = %v, want [%s]", flag, got, want)
+		}
+	}
 }
 
 func TestDesiredReplicasFollowsTheAutoscaler(t *testing.T) {

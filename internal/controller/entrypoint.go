@@ -25,6 +25,17 @@ import (
 	kahunav1alpha1 "github.com/kahunakv/k8s-operator/api/v1alpha1"
 )
 
+const (
+	// rebalancerConcurrentTransfers is how many balance moves may backfill at once. The server's
+	// default of one keeps skew-smoothing from competing with client traffic, which is the wrong
+	// trade for a cluster whose size the operator changes: a node added for capacity carries none
+	// until its replicas arrive. Four filled a 24-partition node in about a minute under load.
+	rebalancerConcurrentTransfers = 4
+	// rebalancerMovesPerPass bounds new moves per controller pass across repairs and transfers. It
+	// must be at least the server's default of three concurrent repairs plus the transfers above.
+	rebalancerMovesPerPass = 8
+)
+
 // serverDLLPath is where every published Kahuna image places the server assembly. The operator
 // overrides the image's own entrypoint and invokes this directly, which is what lets the stock
 // single-node image serve as a cluster member without modification.
@@ -124,9 +135,20 @@ func staticArgs(cluster *kahunav1alpha1.KahunaCluster) []string {
 		// The rebalancer comes with the factor, not as a separate knob. Initial placement happens
 		// without it, but a node added later receives replicas only through rebalancing moves — so a
 		// factor without the rebalancer means every scale-up adds a node that holds no data.
+		//
+		// Its pacing is raised from the server defaults, which are tuned for cosmetic smoothing of
+		// a cluster that is not changing size. Under those defaults a node added by a scale-up
+		// received a handful of replicas in a quarter of an hour, and with the default deadband of
+		// one it then stayed under-filled for good: once every full node was only one replica above
+		// the even share, nothing more was planned. The three values are set together because the
+		// per-pass move budget binds first if it is below repairs plus transfers, and would starve
+		// the repairs that restore durability. Any of them can still be overridden through extraArgs.
 		args = append(args,
 			"--raft-replication-factor", fmt.Sprintf("%d", rep.Factor),
 			"--raft-enable-placement-rebalancer",
+			"--raft-max-concurrent-replica-transfers", fmt.Sprintf("%d", rebalancerConcurrentTransfers),
+			"--raft-max-replica-moves-per-pass", fmt.Sprintf("%d", rebalancerMovesPerPass),
+			"--raft-replica-count-deadband", "0",
 		)
 	}
 
@@ -163,8 +185,44 @@ func staticArgs(cluster *kahunav1alpha1.KahunaCluster) []string {
 		args = flagArgs(args, "--background-writer-workers", w.BackgroundWriter)
 	}
 
-	// extraArgs go last so a user override wins over anything generated above.
-	return append(args, cluster.Spec.ExtraArgs...)
+	// extraArgs go last, and any flag they set is dropped from the generated set first: the server
+	// refuses a repeated option outright ("defined multiple times") rather than taking the last
+	// value, so appending alone would turn an override into a node that never starts.
+	return append(withoutOverridden(args, cluster.Spec.ExtraArgs), cluster.Spec.ExtraArgs...)
+}
+
+// withoutOverridden drops every flag in generated, together with the values that follow it, that
+// extra also sets. A flag is recognised in both the "--name value" and the "--name=value" spelling.
+func withoutOverridden(generated, extra []string) []string {
+	overridden := map[string]bool{}
+	for _, a := range extra {
+		if name, ok := flagName(a); ok {
+			overridden[name] = true
+		}
+	}
+	if len(overridden) == 0 {
+		return generated
+	}
+	out := make([]string, 0, len(generated))
+	skipping := false
+	for _, a := range generated {
+		if name, ok := flagName(a); ok {
+			skipping = overridden[name]
+		}
+		if !skipping {
+			out = append(out, a)
+		}
+	}
+	return out
+}
+
+// flagName returns the option name of a "--name" or "--name=value" token.
+func flagName(token string) (string, bool) {
+	if !strings.HasPrefix(token, "--") {
+		return "", false
+	}
+	name, _, _ := strings.Cut(token, "=")
+	return name, true
 }
 
 // keystoreKey is the Secret key holding the PKCS#12 blob.

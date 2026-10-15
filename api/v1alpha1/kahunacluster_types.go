@@ -533,8 +533,9 @@ type KahunaClusterSpec struct {
 	LogLevel string `json:"logLevel,omitempty"`
 
 	// extraArgs are appended verbatim to the server command line, after every flag the operator
-	// generates. This is the escape hatch for the Kahuna options that have no typed field here;
-	// nothing validates them, and a bad value fails the pod at startup.
+	// generates. A flag given here replaces the operator's own value for it, since the server
+	// rejects a repeated option. This is the escape hatch for the Kahuna options that have no typed
+	// field here; nothing validates them, and a bad value fails the pod at startup.
 	// +optional
 	ExtraArgs []string `json:"extraArgs,omitempty"`
 

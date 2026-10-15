@@ -153,6 +153,11 @@ pass. Removing `spec.autoscaling` hands the count back to `spec.replicas`.
 so a node added is one more copy of all data and one more voter on every write: more cost, no more
 write capacity. With `factor: 3` the operator passes `--raft-replication-factor 3` and
 `--raft-enable-placement-rebalancer`; the rebalancer is what gives a newly added node any data at all.
+It also raises the rebalancer's pacing (`--raft-max-concurrent-replica-transfers 4`,
+`--raft-max-replica-moves-per-pass 8`, `--raft-replica-count-deadband 0`): at the server defaults a
+node added by a scale-up took a quarter of an hour to receive a handful of replicas and then stayed
+under-filled for good, because every full node was within the deadband of the even share. Override
+any of them through `extraArgs` if backfill competes too hard with client traffic.
 
 **Create the cluster with more nodes than the factor.** The server places a partition only if it is
 created while the cluster has more nodes than the factor, and it never converts a fully replicated

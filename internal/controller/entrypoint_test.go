@@ -322,6 +322,45 @@ func TestConfigHashChangesWithConfiguration(t *testing.T) {
 	}
 }
 
+func TestExtraArgsReplaceGeneratedFlagsInsteadOfRepeatingThem(t *testing.T) {
+	cluster := testCluster(4)
+	cluster.Spec.Replication = &kahunav1alpha1.ReplicationSpec{Factor: 3}
+	cluster.Spec.ExtraArgs = []string{
+		"--raft-max-concurrent-replica-transfers", "2",
+		"--raft-replica-count-deadband=1",
+	}
+
+	args := staticArgs(cluster)
+	// The server rejects a repeated option, so the override must be the only occurrence.
+	if got := argValues(args, "--raft-max-concurrent-replica-transfers"); len(got) != 1 || got[0] != "2" {
+		t.Errorf("--raft-max-concurrent-replica-transfers = %v, want the extraArgs value [2]", got)
+	}
+	if n := countFlag(args, "--raft-max-concurrent-replica-transfers"); n != 1 {
+		t.Errorf("--raft-max-concurrent-replica-transfers appears %d times, want 1", n)
+	}
+	if hasFlag(args, "--raft-replica-count-deadband") || !hasFlag(args, "--raft-replica-count-deadband=1") {
+		t.Errorf("--raft-replica-count-deadband=1 did not replace the generated flag: %v", args)
+	}
+	// Flags the user did not touch are untouched.
+	if got := argValues(args, "--raft-max-replica-moves-per-pass"); len(got) != 1 || got[0] != "8" {
+		t.Errorf("--raft-max-replica-moves-per-pass = %v, want [8]", got)
+	}
+	if !hasFlag(args, "--raft-enable-placement-rebalancer") {
+		t.Error("an unrelated generated flag was dropped")
+	}
+}
+
+// countFlag counts the occurrences of a bare flag token.
+func countFlag(args []string, flag string) int {
+	n := 0
+	for _, a := range args {
+		if a == flag {
+			n++
+		}
+	}
+	return n
+}
+
 // The topology file is what carries the replica count to the pod.
 func TestTopologyEnvCarriesReplicasAndBootstrapSize(t *testing.T) {
 	got := topologyEnv(testCluster(5), 3)
