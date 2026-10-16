@@ -31,6 +31,7 @@ import (
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 
+	"github.com/kahunakv/k8s-operator/internal/kahuna"
 	"github.com/kahunakv/k8s-operator/test/utils"
 )
 
@@ -418,7 +419,95 @@ spec:
 			Expect(r).To(Equal("0"), "a node restarted during the rolling update")
 		}
 	})
+
+	// The cluster was founded at 3 nodes without a factor, so every data partition starts fully
+	// replicated. From Kahuna 1.12.3 the rebalancer converts such partitions to replica sets, which
+	// is what lets the autoscaler grow a cluster founded at its factor without adding copies.
+	It("converts fully replicated partitions once a factor is set, then places a new node", func() {
+		before := podUIDs()
+		mustKubectl("-n", testNamespace, "patch", "kahunacluster", clusterName,
+			"--type=merge", "-p", `{"spec":{"replication":{"factor":3}}}`)
+
+		// The factor is a server flag, so the patch rolls every pod. A port-forward opened before
+		// the roll ends would die with the pod it is bound to.
+		Eventually(func() bool {
+			after := podUIDs()
+			if len(after) != len(before) {
+				return false
+			}
+			for name, uid := range before {
+				if after[name] == uid {
+					return false
+				}
+			}
+			return true
+		}, membershipTimeout, pollInterval).Should(BeTrue(), "the factor never rolled the cluster")
+		expectConverged(3)
+
+		withPortForward(func(baseURL string) {
+			By("waiting for every data partition to get a replica set")
+			Eventually(func() ([]int32, error) {
+				p, err := placement(baseURL)
+				if err != nil {
+					return nil, err
+				}
+				if p.ReplicationFactor != 3 || !p.RebalancerEnabled {
+					return nil, fmt.Errorf("factor %d, rebalancer %t", p.ReplicationFactor, p.RebalancerEnabled)
+				}
+				return p.FullyReplicated(), nil
+			}, membershipTimeout, pollInterval).Should(BeEmpty(), "partitions stayed fully replicated")
+		})
+
+		mustKubectl("-n", testNamespace, "patch", "kahunacluster", clusterName,
+			"--type=merge", "-p", `{"spec":{"replicas":4}}`)
+		expectConverged(4)
+
+		withPortForward(func(baseURL string) {
+			By("checking each data partition holds exactly 3 voters on 4 nodes")
+			Eventually(func() (map[int32]int, error) {
+				p, err := placement(baseURL)
+				if err != nil {
+					return nil, err
+				}
+				off := map[int32]int{}
+				for _, part := range p.Partitions {
+					if part.PartitionID == 0 {
+						continue
+					}
+					voters := 0
+					for _, r := range part.Replicas {
+						if r.Role == kahuna.RoleVoter {
+							voters++
+						}
+					}
+					if voters != 3 || len(part.Replicas) != 3 {
+						off[part.PartitionID] = len(part.Replicas)
+					}
+				}
+				return off, nil
+			}, membershipTimeout, pollInterval).Should(BeEmpty(), "a data partition is not at 3 voter replicas")
+
+			Expect(kvGet(baseURL, "e2e/key")).To(Equal("before-scale"))
+		})
+	})
 })
+
+// placement reads the committed replica sets through the client service.
+func placement(baseURL string) (*kahuna.Placement, error) {
+	resp, err := http.Get(baseURL + "/v1/cluster/placement")
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("placement returned HTTP %d", resp.StatusCode)
+	}
+	var p kahuna.Placement
+	if err := json.NewDecoder(resp.Body).Decode(&p); err != nil {
+		return nil, err
+	}
+	return &p, nil
+}
 
 // clusterFieldIn reads a jsonpath expression off an arbitrary resource.
 func clusterFieldIn(namespace, kind, name, path string) string {

@@ -676,7 +676,7 @@ var _ = Describe("KahunaCluster Controller", func() {
 			Expect(getCluster().Status.Autoscaling.DesiredReplicas).To(Equal(int32(3)))
 		})
 
-		It("does not grow a fully replicated cluster past the replication cap", func() {
+		It("holds a fully replicated cluster at the replication cap until the server converts it", func() {
 			obj := getCluster()
 			obj.Spec.Replication = &kahunav1alpha1.ReplicationSpec{Factor: 3}
 			obj.Spec.Autoscaling = &kahunav1alpha1.AutoscalingSpec{
@@ -703,6 +703,14 @@ var _ = Describe("KahunaCluster Controller", func() {
 			Expect(limited).NotTo(BeNil())
 			Expect(limited.Status).To(Equal(metav1.ConditionTrue))
 			Expect(limited.Message).To(ContainSubstring("fully replicated"))
+
+			// Kahuna 1.12.3 converts those partitions to replica sets on its own. Once placement
+			// shows them placed, the same load grows the cluster with no change to the spec.
+			for range 4 {
+				reconcileUsing(&fakeKahuna{membership: rosterOf(cluster, 3), metrics: load})
+			}
+			Expect(getCluster().Status.Autoscaling.DesiredReplicas).To(Equal(int32(4)))
+			Expect(*getSTS().Spec.Replicas).To(Equal(int32(4)))
 		})
 
 		It("holds and says why when the metrics endpoint is missing", func() {

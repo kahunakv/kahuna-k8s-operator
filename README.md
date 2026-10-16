@@ -171,12 +171,16 @@ node added by a scale-up took a quarter of an hour to receive a handful of repli
 under-filled for good, because every full node was within the deadband of the even share. Override
 any of them through `extraArgs` if backfill competes too hard with client traffic.
 
-**Create the cluster with more nodes than the factor.** The server places a partition only if it is
-created while the cluster has more nodes than the factor, and it never converts a fully replicated
-partition later. A cluster founded at 3 nodes with factor 3 therefore stays fully replicated
-forever. The operator checks `GET /v1/cluster/placement` before every scale-up and refuses to grow
-such a cluster past 3 nodes, reporting why in the `AutoscalingLimited` condition. Founding at 4 or
-more is the workaround until the server can convert existing partitions.
+**Any founding size works, and so does turning the factor on later.** A partition created while
+the cluster has no more nodes than the factor starts fully replicated (no replica set), and so does
+every partition of a cluster that had no factor. From Kahuna 1.12.3 (Kommander 1.10.12) the
+rebalancer converts such a partition: it first commits every current voter as the replica set,
+which moves no data, and then trims that set down to the factor one replica at a time. Older
+servers never convert one. The operator checks `GET /v1/cluster/placement` before every scale-up
+and does not grow past 3 nodes while any data partition is still fully replicated, reporting why in
+the `AutoscalingLimited` condition. On 1.12.3 that limit clears by itself a few rebalancer passes
+after the cluster starts with the factor; on an older server it holds until the cluster is
+recreated with more nodes than the factor.
 
 **Signals are never guessed.** The autoscaler holds — and says so in `AutoscalingLimited` — when any
 ready node's metrics cannot be read (including `--disable-dashboard` in `extraArgs`), and it never
@@ -235,7 +239,7 @@ needs. Set it to `false` when the issuer's CA is in the image's trust store.
 - Kahuna's command-line parser rejects an option it does not define rather than ignoring it, so an
   older server fails at startup on that same flag.
 
-`spec.image` therefore defaults to an exact tag, `kahunakv/kahuna:1.12.2`, rather than to `latest`.
+`spec.image` therefore defaults to an exact tag, `kahunakv/kahuna:1.12.3`, rather than to `latest`.
 A floating tag re-rolls a running cluster on a registry push, and the generated command line is
 version-specific. Raise the tag deliberately, after checking the flags against that release.
 
@@ -282,10 +286,11 @@ entrypoint with its own generated startup script.
 - **No Prometheus endpoint.** Kahuna exposes its metrics only as JSON on `/v1/dashboard/metrics`,
   which the autoscaler reads, so there is no ServiceMonitor to ship.
 - **New nodes catch up through Raft, not from a backup.** A node added by a scale-up joins empty and
-  the leader ships it a snapshot plus the log tail. Seeding it from the latest full/incremental
-  backup in GCS instead needs two server changes first: the stock server registering the GCS
-  backup provider, and `--pitr-bootstrap-from` downloading the full backup's checkpoint itself
-  (today it assumes the checkpoint is already on disk).
+  the leader ships it a snapshot plus the log tail. Kahuna 1.12.3 can seed a node itself
+  (`--pitr-bootstrap-from latest` copies and verifies the full backup's checkpoint, replays the
+  chain, then joins), but only from a backup it can read. The stock server still registers no GCS
+  backup provider, and under a replication factor a node-local backup does not cover every
+  partition, so the operator has nowhere shared to keep backups until the server ships GCS.
 - **`nodeId` reads 0 for founding roster members.** Kommander seeds the initial roster from
   discovery, which yields endpoints but not node ids, so peers are recorded with a provisional 0
   that a later Join RPC would replace — and a founding node never sends one
@@ -296,12 +301,12 @@ entrypoint with its own generated startup script.
 ## Not yet implemented
 
 - Backup/restore CRDs over the existing `/v1/backups/*` endpoints
-- Scheduled coordinated backups to GCS, and seeding scale-up nodes from them (blocked on the two
-  server changes listed under *Known gaps*)
+- Scheduled coordinated backups to GCS, and seeding scale-up nodes from them (blocked on the GCS
+  backup provider in the stock server, listed under *Known gaps*)
 
 ## Verified
 
-`make test-e2e` runs all of the below against a real kind cluster — 8 specs, ~4m, using the
+`make test-e2e` runs all of the below against a real kind cluster — 9 specs, ~8m, using the
 published `kahunakv/kahuna` image. It is wired into CI on every push and pull request.
 
 - Bootstrap to 3 Voters in ~20s, producing exactly **one** StatefulSet revision — no spurious roll
@@ -313,5 +318,7 @@ published `kahunakv/kahuna` image. It is wired into CI on every push and pull re
 - Rolling upgrade: one pod at a time, Voters held at 3 throughout, 0 restarts
 - Data written before the scale still readable after 3 → 5 → 3
 - `replicas: 2` and a `partitions` edit both rejected by the API server
+- Replication factor turned on for a cluster founded at 3 nodes: every data partition converts to a
+  replica set, and after a scale to 4 each one holds exactly 3 Voters
 - cert-manager path: `Certificate` issued with a PKCS#12 keystore and a generated password, cluster
   bootstrapped from it in under 40s with `KeystoreReady=True`

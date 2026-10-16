@@ -381,10 +381,10 @@ type ReplicationSpec struct {
 	// factor is the number of voter replicas of each data partition (--raft-replication-factor).
 	// The system partition always spans every node regardless.
 	//
-	// The server applies the factor only to partitions created while the cluster has more nodes
-	// than the factor, and it never converts a fully replicated partition afterwards. A cluster
-	// created with 3 nodes and factor 3 therefore stays fully replicated; create it with at least
-	// 4 nodes to get real placement.
+	// A partition created while the cluster has no more nodes than the factor starts fully
+	// replicated, as does every partition of a cluster that ran without a factor. Kahuna 1.12.3 and
+	// later convert such a partition to a placed one; older servers never do, so on them a cluster
+	// created with 3 nodes and factor 3 stays fully replicated.
 	// +kubebuilder:validation:Minimum=1
 	// +kubebuilder:validation:Maximum=3
 	// +required
@@ -481,7 +481,7 @@ type KahunaClusterSpec struct {
 	// image moves on its own re-rolls every node on a registry push, and the generated command
 	// line is version-specific: a flag the new server no longer accepts stops the node at
 	// startup. Raise this default deliberately, once the flags are checked against that release.
-	// +kubebuilder:default="kahunakv/kahuna:1.12.2"
+	// +kubebuilder:default="kahunakv/kahuna:1.12.3"
 	// +optional
 	Image string `json:"image,omitempty"`
 

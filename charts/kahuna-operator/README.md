@@ -4,7 +4,7 @@ Installs the [Kahuna](https://github.com/kahunakv/kahuna) Kubernetes operator: t
 RBAC, and the `KahunaCluster` CRD.
 
 The chart installs the **operator**, not a Kahuna cluster. Create `KahunaCluster` resources
-afterwards — see the [operator README](../../README.md).
+afterwards — see the [operator README](../../README.md) and [operations guide](../../docs/operations.md) for traffic-based scaling and recovery limits.
 
 ## Install
 

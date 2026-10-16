@@ -344,13 +344,15 @@ func decideAutoscale(in autoscaleInput) autoscaleDecision {
 // growthCeiling decides how far the cluster may grow while still honouring the replication cap.
 //
 // A data partition with no replica set lives on every node, so each node added is another copy of
-// it. The server never converts such a partition to a placed one, so the only way to keep it at or
-// below maxReplicationFactor copies is to not grow past that many nodes.
+// it. Kahuna 1.12.3 converts such a partition to a placed one within a few rebalancer passes, after
+// which this ceiling lifts by itself; an older server never does. Until then the only way to keep
+// it at or below maxReplicationFactor copies is to not grow past that many nodes.
 func growthCeiling(p *kahuna.Placement) (int32, string) {
 	if full := p.FullyReplicated(); len(full) > 0 {
 		return maxReplicationFactor, fmt.Sprintf(
 			"partitions %v are fully replicated, so growing past %d nodes would exceed %d copies; "+
-				"the cluster must be created with more nodes than its replication factor",
+				"Kahuna 1.12.3 or later converts them shortly after start; an older server needs a cluster "+
+				"created with more nodes than its replication factor",
 			full, maxReplicationFactor, maxReplicationFactor)
 	}
 	return 0, ""
