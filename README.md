@@ -188,6 +188,69 @@ scales down on a partial view, since the missing node may be the leader carrying
 `kahuna.kv.write.admitted` counts direct writes only; transactional writes show up through the queue
 depth signal.
 
+## Backups
+
+```yaml
+spec:
+  backup:
+    schedule: "0 2 * * *"            # full backups, cron, UTC unless CRON_TZ=<zone> is given
+    incrementalSchedule: "*/15 * * * *"  # optional
+    volume:
+      claim:                         # or claimName: <existing ReadWriteMany claim>
+        size: 100Gi
+        storageClassName: filestore  # any class that supports ReadWriteMany
+    retention:
+      maxChains: 7
+      # maxAge: 168h
+      # maxBytes: 500Gi
+    # clusterID: kv/kahuna           # defaults to <namespace>/<name>
+    # macKeySecretRef: {name: my-key, key: key}
+    # timeout: 1h
+    # suspend: false
+```
+
+Leave `backup` out and the cluster takes no backups. With it, every node mounts one shared volume
+and runs with `--pitr-backup-dir /backup/<name>`, so all nodes read one backup catalog. A shared
+catalog is what lets a node find an incremental's parent and list every backup; a volume per node
+would give each node only the backups it took itself.
+
+The operator drives the schedule. A full backup is a coordinated backup
+(`POST /v1/backups/coordinated`): the server takes it at one cut time that is the same for every
+partition. Only the meta-partition leader accepts it, so the operator sends it to each ready node in
+turn until one does. An incremental (`POST /v1/backups/incremental`) adds the log written since the
+latest backup. The first full backup runs as soon as the cluster is steady after `backup` is added;
+after that each kind runs on its own schedule, and missed runs collapse into one, as with a CronJob.
+
+- **Backups run in the background.** A full backup can take many minutes, so the reconcile starts it
+  and collects the result on a later pass; scaling and rollouts are not held for it.
+- **A backup waits for a steady cluster:** bootstrap complete, roster converged, and every pod ready
+  on the current configuration. Turning backups on rolls the cluster, and the first backup waits
+  for the rollout to finish.
+- **Status.** `status.backup` records the last backup id and type, the schedule anchors, and the
+  failures. The `BackupFailing` condition is true while the latest attempt failed. A failed backup
+  stays due and is retried after a backoff (1 minute, doubling to 30). If an incremental's parent is
+  gone from the catalog, a new chain starts with a full backup at once.
+- **Retention** maps to `--backup-retention-*`. The server deletes whole chains and always keeps the
+  newest one. The periodic GC pass is turned off (`--backup-gc-interval 0`): its orphan sweep would
+  delete a backup that another node has in progress on the shared volume. GC still runs after each
+  backup, on the node that took it.
+- **The claim and the signing key outlive the cluster.** Neither the `<name>-backup` claim nor the
+  generated `<name>-backup-mac` Secret has an owner reference, so deleting the KahunaCluster or
+  removing `backup` keeps both. The server refuses to restore or seed from a signed backup without
+  its key.
+
+**Refused under a replication factor the cluster can outgrow.** A Kahuna backup holds only the
+partitions the node taking it hosts, and restore and seeding refuse a backup that does not cover
+every partition. So `backup` is refused when `replication.factor` is less than the most nodes the
+cluster can have (`autoscaling.maxReplicas`, or `replicas`). With the factor capped at 3, that leaves
+backups for clusters without a factor, and for clusters of at most 3 nodes. Lifting this needs a
+server change: kahuna feature `5b5461f9` asks for a coordinated backup that covers every partition.
+
+**Restore is manual for now.** See the
+[server backup guide](https://github.com/kahunakv/kahuna/blob/main/docs/backups-and-point-in-time-recovery-guide.md).
+The backup endpoints have no authentication of their own; anything that can reach a node's
+plaintext port can start a backup or list the catalog.
+
 ## TLS
 
 TLS is not optional for a multi-node cluster: the Raft port is an HTTPS listener and inter-node gRPC
@@ -288,9 +351,10 @@ entrypoint with its own generated startup script.
 - **New nodes catch up through Raft, not from a backup.** A node added by a scale-up joins empty and
   the leader ships it a snapshot plus the log tail. Kahuna 1.12.3 can seed a node itself
   (`--pitr-bootstrap-from latest` copies and verifies the full backup's checkpoint, replays the
-  chain, then joins), but only from a backup it can read. The stock server still registers no GCS
-  backup provider, and under a replication factor a node-local backup does not cover every
-  partition, so the operator has nowhere shared to keep backups until the server ships GCS.
+  chain, then joins), but only from a backup that covers every partition. The clusters that scale
+  are the ones with a replication factor, and their backups never do (kahuna feature `5b5461f9`).
+- **Backups go to a shared volume only.** The stock server registers no GCS backup provider (kahuna
+  task `19b5142e`), so a bucket cannot be a backup target yet.
 - **`nodeId` reads 0 for founding roster members.** Kommander seeds the initial roster from
   discovery, which yields endpoints but not node ids, so peers are recorded with a provisional 0
   that a later Join RPC would replace — and a founding node never sends one
@@ -300,9 +364,9 @@ entrypoint with its own generated startup script.
 
 ## Not yet implemented
 
-- Backup/restore CRDs over the existing `/v1/backups/*` endpoints
-- Scheduled coordinated backups to GCS, and seeding scale-up nodes from them (blocked on the GCS
-  backup provider in the stock server, listed under *Known gaps*)
+- Restore, as a CRD or as a field, over the existing `/v1/restore` endpoint
+- Backups to GCS, and seeding scale-up nodes from them (blocked on the server, listed under *Known
+  gaps*)
 
 ## Verified
 

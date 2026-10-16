@@ -185,6 +185,29 @@ func staticArgs(cluster *kahunav1alpha1.KahunaCluster) []string {
 		args = flagArgs(args, "--background-writer-workers", w.BackgroundWriter)
 	}
 
+	if b := cluster.Spec.Backup; b != nil {
+		args = append(args,
+			"--pitr-backup-dir", backupPath(cluster),
+			"--pitr-backup-cluster-id", backupClusterID(cluster),
+			"--pitr-backup-mac-key-file", backupMACKeyPath,
+			// The periodic GC pass is off because every node shares one backup directory. Its orphan
+			// sweep treats artifacts that have no manifest yet as left over from a crash, and a backup
+			// in progress on another node looks exactly like that: a sweep from any other node would
+			// delete it. With the pass off, GC runs only inline after each backup, on the node that
+			// took it, and the operator never runs two backups of one cluster at once.
+			"--backup-gc-interval", "0",
+		)
+		if r := b.Retention; r != nil {
+			args = flagArgs(args, "--backup-retention-max-chains", r.MaxChains)
+			if r.MaxAge != nil {
+				args = append(args, "--backup-retention-max-age", fmt.Sprintf("%d", int64(r.MaxAge.Seconds())))
+			}
+			if r.MaxBytes != nil {
+				args = append(args, "--backup-retention-max-bytes", fmt.Sprintf("%d", r.MaxBytes.Value()))
+			}
+		}
+	}
+
 	// extraArgs go last, and any flag they set is dropped from the generated set first: the server
 	// refuses a repeated option outright ("defined multiple times") rather than taking the last
 	// value, so appending alone would turn an override into a node that never starts.

@@ -19,6 +19,7 @@ package controller
 import (
 	"context"
 	"fmt"
+	"sync"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
@@ -58,6 +59,36 @@ type fakeKahuna struct {
 	placementErr error
 	// metrics returns the dashboard metrics for a base URL; nil means the endpoint is absent.
 	metrics func(baseURL string) *kahuna.Metrics
+	// backup answers a backup request sent to a base URL; nil means every node takes it. Backups
+	// run on the operator's background runner, so the calls are recorded under a lock.
+	backup      func(baseURL string) (*kahuna.BackupInfo, error)
+	backupMu    sync.Mutex
+	backupCalls []string
+}
+
+func (f *fakeKahuna) takeBackup(baseURL string, typ string) (*kahuna.BackupInfo, error) {
+	f.backupMu.Lock()
+	f.backupCalls = append(f.backupCalls, baseURL)
+	n := len(f.backupCalls)
+	f.backupMu.Unlock()
+	if f.backup != nil {
+		return f.backup(baseURL)
+	}
+	return &kahuna.BackupInfo{BackupID: fmt.Sprintf("backup-%d", n), Type: typ}, nil
+}
+
+func (f *fakeKahuna) TakeCoordinatedBackup(_ context.Context, baseURL string) (*kahuna.BackupInfo, error) {
+	return f.takeBackup(baseURL, kahuna.BackupTypeFull)
+}
+
+func (f *fakeKahuna) TakeIncrementalBackup(_ context.Context, baseURL, _ string) (*kahuna.BackupInfo, error) {
+	return f.takeBackup(baseURL, kahuna.BackupTypeIncremental)
+}
+
+func (f *fakeKahuna) calls() []string {
+	f.backupMu.Lock()
+	defer f.backupMu.Unlock()
+	return append([]string(nil), f.backupCalls...)
 }
 
 func (f *fakeKahuna) Placement(context.Context, string) (*kahuna.Placement, error) {
@@ -744,6 +775,169 @@ var _ = Describe("KahunaCluster Controller", func() {
 			obj.Spec.Replication = &kahunav1alpha1.ReplicationSpec{Factor: 3}
 			obj.Spec.Autoscaling = &kahunav1alpha1.AutoscalingSpec{
 				MinReplicas: 1, MaxReplicas: 6, TargetWritesPerSecond: ptr.To(int32(1000)),
+			}
+			Expect(k8sClient.Update(ctx, obj)).NotTo(Succeed())
+		})
+	})
+
+	Context("backups", func() {
+		enableBackups := func() {
+			obj := getCluster()
+			obj.Spec.Backup = &kahunav1alpha1.BackupSpec{
+				Schedule: testBackupSchedule,
+				Volume: kahunav1alpha1.BackupVolumeSpec{
+					Claim: &kahunav1alpha1.VolumeSpec{Size: resource.MustParse("5Gi")},
+				},
+			}
+			Expect(k8sClient.Update(ctx, obj)).To(Succeed())
+		}
+
+		// rollOut stands in for the StatefulSet controller restarting every pod on the current
+		// template: the backup scheduler waits for the pods to carry the template's config hash.
+		rollOut := func() {
+			hash := getSTS().Spec.Template.Annotations[configHashAnnotation]
+			Expect(hash).NotTo(BeEmpty())
+			for i := range int32(3) {
+				pod := &corev1.Pod{}
+				Expect(k8sClient.Get(ctx, types.NamespacedName{Name: podName(cluster, i), Namespace: namespace}, pod)).To(Succeed())
+				pod.Annotations = map[string]string{configHashAnnotation: hash}
+				Expect(k8sClient.Update(ctx, pod)).To(Succeed())
+			}
+		}
+
+		It("creates the shared claim and the signing key, and keeps both when the cluster is deleted", func() {
+			enableBackups()
+			reconcileWith(rosterOf(cluster, 3), nil)
+
+			pvc := &corev1.PersistentVolumeClaim{}
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name + "-backup", Namespace: namespace}, pvc)).To(Succeed())
+			Expect(pvc.Spec.AccessModes).To(ConsistOf(corev1.ReadWriteMany))
+			Expect(pvc.OwnerReferences).To(BeEmpty())
+
+			secret := &corev1.Secret{}
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name + "-backup-mac", Namespace: namespace}, secret)).To(Succeed())
+			Expect(secret.Data[backupMACKey]).To(HaveLen(backupMACKeyBytes))
+			Expect(secret.OwnerReferences).To(BeEmpty())
+
+			// The key is never rewritten: a new key would orphan every backup signed with the old one.
+			key := secret.Data[backupMACKey]
+			reconcileWith(rosterOf(cluster, 3), nil)
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name + "-backup-mac", Namespace: namespace}, secret)).To(Succeed())
+			Expect(secret.Data[backupMACKey]).To(Equal(key))
+
+			templateVolumes := getSTS().Spec.Template.Spec.Volumes
+			volumes := make([]string, 0, len(templateVolumes))
+			for _, v := range templateVolumes {
+				volumes = append(volumes, v.Name)
+			}
+			Expect(volumes).To(ContainElements(backupVolumeName, backupMACVolumeName))
+		})
+
+		It("waits for the rollout, then takes the first full backup and records it", func() {
+			reconcileWith(rosterOf(cluster, 3), nil)
+			enableBackups()
+
+			// The pods still run the template from before backups were turned on.
+			fake := reconcileUsing(&fakeKahuna{membership: rosterOf(cluster, 3)})
+			Expect(fake.calls()).To(BeEmpty())
+			failing := apimeta.FindStatusCondition(getCluster().Status.Conditions, kahunav1alpha1.ConditionBackupFailing)
+			Expect(failing).NotTo(BeNil())
+			Expect(failing.Status).To(Equal(metav1.ConditionFalse))
+			Expect(failing.Reason).To(Equal("BackupWaiting"))
+
+			rollOut()
+			fake = reconcileUsing(&fakeKahuna{membership: rosterOf(cluster, 3)})
+			Eventually(fake.calls).Should(HaveLen(1))
+
+			// The next pass collects the result from the background runner.
+			Eventually(func() string {
+				reconcileUsing(&fakeKahuna{membership: rosterOf(cluster, 3)})
+				return getCluster().Status.Backup.LastBackupID
+			}).Should(Equal("backup-1"))
+			st := getCluster().Status.Backup
+			Expect(st.LastBackupType).To(Equal(kahuna.BackupTypeFull))
+			Expect(st.LastFullScheduleTime).NotTo(BeNil())
+			Expect(st.ConsecutiveFailures).To(BeZero())
+
+			// The next full backup is a day away, so nothing more is sent.
+			fake = reconcileUsing(&fakeKahuna{membership: rosterOf(cluster, 3)})
+			Consistently(fake.calls, "200ms").Should(BeEmpty())
+		})
+
+		It("records a failed backup and holds the retry", func() {
+			reconcileWith(rosterOf(cluster, 3), nil)
+			enableBackups()
+			reconcileWith(rosterOf(cluster, 3), nil)
+			rollOut()
+
+			refuse := &fakeKahuna{membership: rosterOf(cluster, 3), backup: func(string) (*kahuna.BackupInfo, error) {
+				return nil, &kahuna.BackupError{StatusCode: 422, Outcome: "IoError", Detail: "disk full"}
+			}}
+			reconcileUsing(refuse)
+			Eventually(refuse.calls).Should(HaveLen(1))
+			Eventually(func() int32 {
+				reconcileUsing(&fakeKahuna{membership: rosterOf(cluster, 3)})
+				return getCluster().Status.Backup.ConsecutiveFailures
+			}).Should(Equal(int32(1)))
+
+			out := getCluster()
+			Expect(out.Status.Backup.LastFailureMessage).To(ContainSubstring("disk full"))
+			failing := apimeta.FindStatusCondition(out.Status.Conditions, kahunav1alpha1.ConditionBackupFailing)
+			Expect(failing.Status).To(Equal(metav1.ConditionTrue))
+
+			// Within the backoff nothing is sent.
+			fake := reconcileUsing(&fakeKahuna{membership: rosterOf(cluster, 3)})
+			Consistently(fake.calls, "200ms").Should(BeEmpty())
+		})
+
+		It("drops the backup state when backups are turned off", func() {
+			enableBackups()
+			reconcileWith(rosterOf(cluster, 3), nil)
+			Expect(getCluster().Status.Backup).NotTo(BeNil())
+
+			obj := getCluster()
+			obj.Spec.Backup = nil
+			Expect(k8sClient.Update(ctx, obj)).To(Succeed())
+			reconcileWith(rosterOf(cluster, 3), nil)
+
+			out := getCluster()
+			Expect(out.Status.Backup).To(BeNil())
+			Expect(apimeta.FindStatusCondition(out.Status.Conditions, kahunav1alpha1.ConditionBackupFailing)).To(BeNil())
+			// The claim stays: it holds the backups.
+			pvc := &corev1.PersistentVolumeClaim{}
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name + "-backup", Namespace: namespace}, pvc)).To(Succeed())
+		})
+
+		It("rejects backups when the cluster can outgrow its replication factor", func() {
+			obj := getCluster()
+			obj.Spec.Replicas = ptr.To(int32(5))
+			obj.Spec.Replication = &kahunav1alpha1.ReplicationSpec{Factor: 3}
+			obj.Spec.Backup = &kahunav1alpha1.BackupSpec{
+				Schedule: testBackupSchedule,
+				Volume:   kahunav1alpha1.BackupVolumeSpec{ClaimName: ptr.To("shared")},
+			}
+			err := k8sClient.Update(ctx, obj)
+			Expect(err).To(HaveOccurred())
+			Expect(err.Error()).To(ContainSubstring("backup is refused when a replication factor is set"))
+
+			// Every node hosts every partition when the factor covers the whole cluster.
+			obj = getCluster()
+			obj.Spec.Replication = &kahunav1alpha1.ReplicationSpec{Factor: 3}
+			obj.Spec.Backup = &kahunav1alpha1.BackupSpec{
+				Schedule: testBackupSchedule,
+				Volume:   kahunav1alpha1.BackupVolumeSpec{ClaimName: ptr.To("shared")},
+			}
+			Expect(k8sClient.Update(ctx, obj)).To(Succeed())
+		})
+
+		It("rejects a backup volume that names both a claim and a template", func() {
+			obj := getCluster()
+			obj.Spec.Backup = &kahunav1alpha1.BackupSpec{
+				Schedule: testBackupSchedule,
+				Volume: kahunav1alpha1.BackupVolumeSpec{
+					ClaimName: ptr.To("shared"),
+					Claim:     &kahunav1alpha1.VolumeSpec{Size: resource.MustParse("5Gi")},
+				},
 			}
 			Expect(k8sClient.Update(ctx, obj)).NotTo(Succeed())
 		})

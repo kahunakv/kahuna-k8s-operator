@@ -21,6 +21,7 @@ limitations under the License.
 package kahuna
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -213,6 +214,69 @@ func (m *Metrics) GaugeSum(metric string) (float64, bool) {
 	return sum, found
 }
 
+// Backup types reported by the server in BackupInfo.Type.
+const (
+	BackupTypeFull        = "Full"
+	BackupTypeIncremental = "Incremental"
+)
+
+// Backup outcomes the server reports for a refused backup request, in the X-Kahuna-Backup-Outcome
+// header and the "outcome" field of the problem body. Only the outcomes the operator acts on are
+// named; the server has more.
+const (
+	// BackupOutcomeNotBackupCoordinator means the node does not lead the meta partition, so it
+	// cannot take a coordinated backup. Another node can.
+	BackupOutcomeNotBackupCoordinator = "NotBackupCoordinator"
+	// BackupOutcomeRetryableLeadershipLoss means leadership moved during the backup.
+	BackupOutcomeRetryableLeadershipLoss = "RetryableLeadershipLoss"
+	// BackupOutcomeCutUnverified means transactions kept overtaking the cut. Nothing was published.
+	BackupOutcomeCutUnverified = "CutUnverified"
+	// BackupOutcomeNotConfigured means the node runs without --pitr-backup-dir, which is what a node
+	// not yet restarted with the backup flags looks like.
+	BackupOutcomeNotConfigured = "NotConfigured"
+	// BackupOutcomeParentMissing means the catalog has no backup with the requested parent id.
+	BackupOutcomeParentMissing = "ParentMissing"
+)
+
+// BackupInfo is the server's description of one backup (KahunaBackupInfo). Only the fields the
+// operator uses are decoded.
+type BackupInfo struct {
+	BackupID        string `json:"backupId"`
+	Type            string `json:"type"`
+	ParentBackupID  string `json:"parentBackupId"`
+	ClusterID       string `json:"clusterId"`
+	CoordinatorNode string `json:"coordinatorNode"`
+	// ActualKind differs from the requested kind when the server took a full backup in place of an
+	// incremental one; SubstitutionReason then says why.
+	ActualKind         string `json:"actualKind"`
+	SubstitutionReason string `json:"substitutionReason"`
+}
+
+// BackupError is a backup request the server refused with a typed outcome.
+type BackupError struct {
+	StatusCode int
+	Outcome    string
+	Detail     string
+}
+
+func (e *BackupError) Error() string {
+	if e.Detail == "" {
+		return fmt.Sprintf("backup refused with HTTP %d (%s)", e.StatusCode, e.Outcome)
+	}
+	return fmt.Sprintf("backup refused with HTTP %d (%s): %s", e.StatusCode, e.Outcome, e.Detail)
+}
+
+// TryAnotherNode reports whether a different node can still take the backup now. Every other
+// outcome is a refusal that a different node would repeat.
+func (e *BackupError) TryAnotherNode() bool {
+	switch e.Outcome {
+	case BackupOutcomeNotBackupCoordinator, BackupOutcomeRetryableLeadershipLoss,
+		BackupOutcomeCutUnverified, BackupOutcomeNotConfigured:
+		return true
+	}
+	return false
+}
+
 // Client reads cluster state from a Kahuna node, and asks one to decommission itself.
 type Client interface {
 	// Membership returns the committed roster as seen by the node at baseURL.
@@ -230,6 +294,12 @@ type Client interface {
 	// Metrics returns the node's curated engine metrics. The endpoint does not exist when the
 	// server runs with --disable-dashboard, which callers must treat as "signal unknown".
 	Metrics(ctx context.Context, baseURL string) (*Metrics, error)
+	// TakeCoordinatedBackup asks the node to take a full backup at one cluster-wide cut. Only the
+	// meta-partition leader accepts it. A refusal comes back as a *BackupError.
+	TakeCoordinatedBackup(ctx context.Context, baseURL string) (*BackupInfo, error)
+	// TakeIncrementalBackup asks the node to back up the log written since the parent backup. A
+	// refusal comes back as a *BackupError.
+	TakeIncrementalBackup(ctx context.Context, baseURL, parentBackupID string) (*BackupInfo, error)
 }
 
 // Default timeouts. A status read and a leave need different bounds, and one value cannot serve
@@ -380,6 +450,73 @@ func (c *HTTPClient) Metrics(ctx context.Context, baseURL string) (*Metrics, err
 		return nil, fmt.Errorf("metrics query returned HTTP %d", code)
 	}
 	return &m, nil
+}
+
+// backupOutcomeHeader carries the typed outcome of a refused backup request.
+const backupOutcomeHeader = "X-Kahuna-Backup-Outcome"
+
+// TakeCoordinatedBackup implements Client.
+//
+// No bound of its own: a full backup copies the whole store and can take minutes. The caller's
+// context carries the deadline, and the server cancels the backup when the request ends.
+func (c *HTTPClient) TakeCoordinatedBackup(ctx context.Context, baseURL string) (*BackupInfo, error) {
+	return c.postBackup(ctx, baseURL+"/v1/backups/coordinated", nil)
+}
+
+// TakeIncrementalBackup implements Client. It is bounded by the caller's context, as above.
+func (c *HTTPClient) TakeIncrementalBackup(ctx context.Context, baseURL, parentBackupID string) (*BackupInfo, error) {
+	body, err := json.Marshal(map[string]string{"parentBackupId": parentBackupID})
+	if err != nil {
+		return nil, err
+	}
+	return c.postBackup(ctx, baseURL+"/v1/backups/incremental", body)
+}
+
+// postBackup sends a backup request. A 200 carries the new backup; every refusal carries a problem
+// body and the outcome header, and comes back as a *BackupError.
+func (c *HTTPClient) postBackup(ctx context.Context, url string, body []byte) (*BackupInfo, error) {
+	var reader io.Reader
+	if body != nil {
+		reader = bytes.NewReader(body)
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, reader)
+	if err != nil {
+		return nil, err
+	}
+	if body != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	resp, err := c.HTTP.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if err != nil {
+		return nil, err
+	}
+	if resp.StatusCode != http.StatusOK {
+		var problem struct {
+			Detail  string `json:"detail"`
+			Outcome string `json:"outcome"`
+		}
+		// A body that does not decode still leaves the status and header, which are the answer.
+		_ = json.Unmarshal(raw, &problem)
+		outcome := resp.Header.Get(backupOutcomeHeader)
+		if outcome == "" {
+			outcome = problem.Outcome
+		}
+		return nil, &BackupError{StatusCode: resp.StatusCode, Outcome: outcome, Detail: problem.Detail}
+	}
+	var info BackupInfo
+	if err := json.Unmarshal(raw, &info); err != nil {
+		return nil, fmt.Errorf("decoding backup response: %w", err)
+	}
+	if info.BackupID == "" {
+		return nil, fmt.Errorf("backup response carries no backup id")
+	}
+	return &info, nil
 }
 
 // Leave implements Client.

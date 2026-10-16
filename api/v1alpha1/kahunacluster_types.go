@@ -65,6 +65,9 @@ const (
 	// ConditionAutoscalingLimited is true when the autoscaler wants a size it is not allowed to
 	// reach: a bound, an unreadable signal, or a replication factor the cluster cannot yet honour.
 	ConditionAutoscalingLimited = "AutoscalingLimited"
+	// ConditionBackupFailing is true when the latest scheduled backup failed, or the backup schedule
+	// cannot be parsed. It stays false while backups succeed or wait for the cluster to settle.
+	ConditionBackupFailing = "BackupFailing"
 )
 
 // PVCRetentionPolicy controls what happens to a node's PersistentVolumeClaims when its pod is
@@ -446,6 +449,104 @@ type AutoscalingSpec struct {
 	TolerancePercent *int32 `json:"tolerancePercent,omitempty"`
 }
 
+// BackupVolumeSpec selects the volume that holds the backup catalog. Every node mounts the same
+// volume, because the catalog is whatever is in the backup directory: a node finds an incremental's
+// parent, and lists backups, only from there. A volume per node would give each node a partial
+// catalog, and an incremental taken on a node that did not take its parent would fail.
+// +kubebuilder:validation:XValidation:rule="has(self.claimName) != has(self.claim)",message="exactly one of backup.volume.claimName or backup.volume.claim must be set"
+type BackupVolumeSpec struct {
+	// claimName names an existing PersistentVolumeClaim in the cluster's namespace. It must be
+	// ReadWriteMany when the cluster has more than one node.
+	// +kubebuilder:validation:MinLength=1
+	// +optional
+	ClaimName *string `json:"claimName,omitempty"`
+
+	// claim asks the operator to create a PersistentVolumeClaim named <cluster>-backup. Access
+	// modes default to ReadWriteMany. The operator creates the claim once and does not change it
+	// later. Deleting the KahunaCluster, or removing spec.backup, does not delete the claim.
+	// +optional
+	Claim *VolumeSpec `json:"claim,omitempty"`
+}
+
+// BackupRetentionSpec bounds how many backups the server keeps. The server deletes whole chains
+// (a full backup and the incrementals on top of it), and always keeps the newest chain. A bound
+// that is not set does not apply. With no bound set, the server keeps every backup.
+type BackupRetentionSpec struct {
+	// maxChains keeps at most this many of the newest chains (--backup-retention-max-chains).
+	// +kubebuilder:validation:Minimum=1
+	// +optional
+	MaxChains *int32 `json:"maxChains,omitempty"`
+
+	// maxAge deletes a chain when its newest backup is older than this
+	// (--backup-retention-max-age). It is rounded down to whole seconds.
+	// +optional
+	MaxAge *metav1.Duration `json:"maxAge,omitempty"`
+
+	// maxBytes keeps the newest chains whose combined size stays within this budget
+	// (--backup-retention-max-bytes).
+	// +optional
+	MaxBytes *resource.Quantity `json:"maxBytes,omitempty"`
+}
+
+// BackupSpec turns on scheduled backups to a volume that every node shares.
+//
+// Full backups are coordinated: the server takes them at one cut time that is the same for every
+// partition. Incremental backups add the log written since the latest backup. A backup holds only
+// the partitions that the node taking it hosts, so a backup is restorable only when one node hosts
+// every partition. The KahunaCluster validation therefore refuses spec.backup when a replication
+// factor is set and the cluster can have more nodes than the factor.
+//
+// Adding, removing or changing anything here except the schedules and suspend changes the server
+// command line, which rolls the cluster one node at a time.
+type BackupSpec struct {
+	// schedule is when to take a full backup, in cron format ("0 2 * * *", "@daily"). Times are UTC
+	// unless the schedule starts with CRON_TZ=<zone>. The first full backup runs as soon as the
+	// cluster is steady after backups are turned on.
+	// +kubebuilder:validation:MinLength=1
+	// +required
+	Schedule string `json:"schedule"`
+
+	// incrementalSchedule is when to take an incremental backup on top of the latest backup, in the
+	// same format. Unset means full backups only. Each incremental must start within the server's
+	// PITR window (--pitr-window, 1 hour by default) of its parent, or the server takes a full
+	// backup in its place.
+	// +optional
+	IncrementalSchedule string `json:"incrementalSchedule,omitempty"`
+
+	// suspend stops new scheduled backups. A backup already running continues.
+	// +optional
+	Suspend *bool `json:"suspend,omitempty"`
+
+	// timeout bounds one backup request. When it expires the operator cancels the request, and the
+	// server stops the backup without publishing it.
+	// +kubebuilder:default="1h"
+	// +optional
+	Timeout *metav1.Duration `json:"timeout,omitempty"`
+
+	// volume is the shared volume that holds the backups. The server writes them under a
+	// directory named after the cluster, so two clusters can share one claim.
+	// +required
+	Volume BackupVolumeSpec `json:"volume"`
+
+	// clusterID is stamped into every backup (--pitr-backup-cluster-id). A node seeded from a backup
+	// refuses a backup with a different id. Defaults to <namespace>/<name>. Set it explicitly to
+	// keep the id when you restore the backups into a cluster with a different name.
+	// +kubebuilder:validation:MaxLength=253
+	// +optional
+	ClusterID string `json:"clusterID,omitempty"`
+
+	// macKeySecretRef points at the key that signs every backup manifest
+	// (--pitr-backup-mac-key-file). When unset, the operator generates a random key in a Secret
+	// named <cluster>-backup-mac. That Secret is not deleted with the KahunaCluster: without the key
+	// the server refuses to restore or seed from the backups it signed.
+	// +optional
+	MACKeySecretRef *corev1.SecretKeySelector `json:"macKeySecretRef,omitempty"`
+
+	// retention bounds how many backups the server keeps.
+	// +optional
+	Retention *BackupRetentionSpec `json:"retention,omitempty"`
+}
+
 // KahunaClusterSpec defines the desired state of a Kahuna cluster.
 type KahunaClusterSpec struct {
 	// replicas is the number of Kahuna nodes. Raft needs an odd count for a clean majority;
@@ -473,6 +574,10 @@ type KahunaClusterSpec struct {
 	// autoscaling lets the operator add and remove nodes with traffic.
 	// +optional
 	Autoscaling *AutoscalingSpec `json:"autoscaling,omitempty"`
+
+	// backup turns on scheduled backups. Unset means no backups.
+	// +optional
+	Backup *BackupSpec `json:"backup,omitempty"`
 
 	// image is the Kahuna server image. The operator overrides the image entrypoint with its own
 	// generated startup script, so the stock single-node image works unmodified.
@@ -656,6 +761,45 @@ type AutoscalingStatus struct {
 	LastScaleTime *metav1.Time `json:"lastScaleTime,omitempty"`
 }
 
+// BackupStatus is the backup scheduler's memory between reconciles. A schedule time advances only
+// when its backup succeeds, so a failed backup stays due and is retried with a backoff.
+type BackupStatus struct {
+	// lastFullScheduleTime is the scheduled time of the latest full backup that succeeded. The next
+	// full backup is due at the first schedule time after it.
+	// +optional
+	LastFullScheduleTime *metav1.Time `json:"lastFullScheduleTime,omitempty"`
+
+	// lastIncrementalScheduleTime is the scheduled time of the latest incremental backup that
+	// succeeded, or the time of the latest full backup when that is later.
+	// +optional
+	LastIncrementalScheduleTime *metav1.Time `json:"lastIncrementalScheduleTime,omitempty"`
+
+	// lastSuccessfulTime is when the latest backup of either type completed.
+	// +optional
+	LastSuccessfulTime *metav1.Time `json:"lastSuccessfulTime,omitempty"`
+
+	// lastBackupID is the id of the latest backup. The next incremental uses it as its parent.
+	// +optional
+	LastBackupID string `json:"lastBackupID,omitempty"`
+
+	// lastBackupType is Full or Incremental, as the server took it. The server takes a full backup
+	// in place of an incremental one when the incremental cannot continue the chain.
+	// +optional
+	LastBackupType string `json:"lastBackupType,omitempty"`
+
+	// consecutiveFailures counts the backups that failed since the latest success.
+	// +optional
+	ConsecutiveFailures int32 `json:"consecutiveFailures,omitempty"`
+
+	// lastFailureTime is when the latest failed backup ended.
+	// +optional
+	LastFailureTime *metav1.Time `json:"lastFailureTime,omitempty"`
+
+	// lastFailureMessage is why the latest failed backup failed.
+	// +optional
+	LastFailureMessage string `json:"lastFailureMessage,omitempty"`
+}
+
 // KahunaClusterStatus defines the observed state of a Kahuna cluster.
 type KahunaClusterStatus struct {
 	// observedGeneration is the spec generation this status reflects.
@@ -721,6 +865,10 @@ type KahunaClusterStatus struct {
 	// +optional
 	Autoscaling *AutoscalingStatus `json:"autoscaling,omitempty"`
 
+	// backup is the backup scheduler's state. Present only while spec.backup is set.
+	// +optional
+	Backup *BackupStatus `json:"backup,omitempty"`
+
 	// conditions represent the current state of the KahunaCluster resource.
 	// +listType=map
 	// +listMapKey=type
@@ -734,6 +882,7 @@ type KahunaClusterStatus struct {
 // +kubebuilder:validation:XValidation:rule="self.spec.replicas != 2",message="replicas must not be 2: a two-Voter Raft cluster has a quorum of 2 and therefore tolerates no failures; use 1 or 3"
 // +kubebuilder:validation:XValidation:rule="(oldSelf.spec.replicas == 1) == (self.spec.replicas == 1)",message="a single-node (standalone) cluster cannot be scaled into a multi-node cluster, or vice versa: the two use different quorum models and on-disk identities. Create a new KahunaCluster and migrate the data."
 // +kubebuilder:validation:XValidation:rule="!has(self.spec.autoscaling) || has(self.spec.replication)",message="autoscaling requires spec.replication: without a replication factor every node holds every partition, so adding nodes adds copies rather than capacity"
+// +kubebuilder:validation:XValidation:rule="!has(self.spec.backup) || !has(self.spec.replication) || self.spec.replication.factor >= (has(self.spec.autoscaling) ? self.spec.autoscaling.maxReplicas : (has(self.spec.replicas) ? self.spec.replicas : 3))",message="backup is refused when a replication factor is set and the cluster can have more nodes than the factor: a Kahuna backup holds only the partitions the node taking it hosts, so no backup would cover every partition, and restore and seeding refuse such a backup"
 // +kubebuilder:resource:shortName=kahuna;kc
 // +kubebuilder:printcolumn:name="Desired",type=integer,JSONPath=`.spec.replicas`
 // +kubebuilder:printcolumn:name="Autoscaled",type=integer,JSONPath=`.status.autoscaling.desiredReplicas`
@@ -741,6 +890,7 @@ type KahunaClusterStatus struct {
 // +kubebuilder:printcolumn:name="Voters",type=integer,JSONPath=`.status.voters`
 // +kubebuilder:printcolumn:name="Roster",type=integer,JSONPath=`.status.membershipVersion`,priority=1
 // +kubebuilder:printcolumn:name="Phase",type=string,JSONPath=`.status.phase`
+// +kubebuilder:printcolumn:name="Last Backup",type=date,JSONPath=`.status.backup.lastSuccessfulTime`,priority=1
 // +kubebuilder:printcolumn:name="Age",type=date,JSONPath=`.metadata.creationTimestamp`
 
 // KahunaCluster is the Schema for the kahunaclusters API

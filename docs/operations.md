@@ -85,6 +85,16 @@ Removing autoscaling alone restores the old `spec.replicas` value and may immedi
 
 Image/configuration changes roll pods; topology changes do not restart existing pods just to update seeds. Rollouts hold while the roster is unreadable or nonconverged. Secret content changes alone do not alter the startup-script hash, so keystore rotation must include a deliberate rollout. Default pod anti-affinity is soft; configure placement constraints for required failure-domain separation.
 
-There are no backup or scheduled-backup CRDs, backup-volume mounts, or automatic seed-on-scale workflows. Kahuna 1.12.3 can itself copy and verify a PITR full base image, replay the chain, certify WAL boundaries, and then join. That server capability removes the old external-checkpoint-copy requirement; it does not make backup access automatic in this operator. The stock server still has no built-in GCS provider. `extraArgs` cannot add mounts or register one. Under replica placement, a node-local backup may lack cluster-wide partition coverage and be refused for seed/restore.
+`spec.backup` schedules coordinated full backups, and optionally incrementals, to one ReadWriteMany volume that every node mounts (see the README's *Backups* section). It is refused when a replication factor is set below the most nodes the cluster can have, because a backup covers only the taking node's partitions. Check a cluster's backups with:
+
+```bash
+kubectl -n kahuna get kahunacluster kahuna -o jsonpath='{.status.backup}{"\n"}'
+kubectl -n kahuna get kahunacluster kahuna \
+  -o jsonpath='{.status.conditions[?(@.type=="BackupFailing")]}{"\n"}'
+```
+
+To pause backups without a rollout, set `spec.backup.suspend: true`. Schedule and suspend changes do not restart pods; every other `backup` field changes the server command line and rolls the cluster. Do not take manual backups against the shared volume while a scheduled one runs: the inline GC after one backup can delete the other's artifacts before its manifest is published.
+
+There is no restore CRD and no automatic seed-on-scale. The stock server has no built-in GCS provider, and `extraArgs` cannot register one.
 
 See the [server backup guide](https://github.com/kahunakv/kahuna/blob/main/docs/backups-and-point-in-time-recovery-guide.md) for bootstrap, authentication, retention, and coverage requirements, and the [chart upgrade instructions](../charts/kahuna-operator/README.md#upgrading-and-the-crd-caveat) before updating CRDs.

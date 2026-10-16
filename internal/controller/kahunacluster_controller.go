@@ -91,6 +91,9 @@ type KahunaClusterReconciler struct {
 
 	// traffic turns the cluster's cumulative counters into rates for the autoscaler.
 	traffic trafficSampler
+
+	// backups runs scheduled backups outside the reconcile loop.
+	backups backupRunner
 }
 
 // +kubebuilder:rbac:groups=kahuna.kahunakv.io,resources=kahunaclusters,verbs=get;list;watch;create;update;patch;delete
@@ -99,7 +102,7 @@ type KahunaClusterReconciler struct {
 // +kubebuilder:rbac:groups=apps,resources=statefulsets,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="",resources=services;configmaps,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch
-// +kubebuilder:rbac:groups="",resources=persistentvolumeclaims,verbs=get;list;watch;delete
+// +kubebuilder:rbac:groups="",resources=persistentvolumeclaims,verbs=get;list;watch;create;delete
 // +kubebuilder:rbac:groups="",resources=events,verbs=create;patch
 // +kubebuilder:rbac:groups=policy,resources=poddisruptionbudgets,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="",resources=secrets,verbs=get;list;watch;create
@@ -117,6 +120,7 @@ func (r *KahunaClusterReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	if err := reader.Get(ctx, req.NamespacedName, cluster); err != nil {
 		if apierrors.IsNotFound(err) {
 			r.traffic.forget(req.NamespacedName)
+			r.backups.forget(req.NamespacedName)
 		}
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
@@ -152,6 +156,11 @@ func (r *KahunaClusterReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	}
 	if err := r.reconcilePDB(ctx, cluster); err != nil {
 		return ctrl.Result{}, fmt.Errorf("reconciling pod disruption budget: %w", err)
+	}
+	// Before the StatefulSet, for the same reason as the keystore: a pod whose backup claim or key
+	// does not exist yet stays stuck on the missing volume.
+	if err := r.reconcileBackupResources(ctx, cluster); err != nil {
+		return ctrl.Result{}, fmt.Errorf("reconciling backup resources: %w", err)
 	}
 
 	pods, err := r.listPods(ctx, cluster)
@@ -194,9 +203,15 @@ func (r *KahunaClusterReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		return ctrl.Result{}, fmt.Errorf("reconciling stateful set: %w", err)
 	}
 
+	// The backup scheduler edits cluster.Status in memory too, and reconcileStatus persists it.
+	backupWake := r.reconcileBackup(ctx, cluster, membership, pods)
+
 	result, err := r.reconcileStatus(ctx, cluster, persisted, sts, pods, membership)
 	if err != nil {
 		return ctrl.Result{}, fmt.Errorf("updating status: %w", err)
+	}
+	if backupWake > 0 && (result.RequeueAfter == 0 || backupWake < result.RequeueAfter) {
+		result.RequeueAfter = backupWake
 	}
 
 	log.V(1).Info("reconciled", "phase", cluster.Status.Phase,

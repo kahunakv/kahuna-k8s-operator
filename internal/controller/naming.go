@@ -48,11 +48,21 @@ const (
 	topologyFileName = "topology.env"
 	topologyPath     = configMountPath + "/" + topologyFileName
 
+	// backupMountPath is where the shared backup volume is mounted. The server's backup directory
+	// is a subdirectory named after the cluster; see backupPath.
+	backupMountPath = "/backup"
+	// backupMACMountPath holds the key that signs backup manifests.
+	backupMACMountPath = "/etc/kahuna/backup-mac"
+	backupMACFileName  = "key"
+	backupMACKeyPath   = backupMACMountPath + "/" + backupMACFileName
+
 	dataVolumeName        = "data"
 	walVolumeName         = "wal"
 	configVolumeName      = "config"
 	tlsVolumeName         = "tls"
 	tlsPasswordVolumeName = "tls-password"
+	backupVolumeName      = "backup"
+	backupMACVolumeName   = "backup-mac"
 
 	containerName = "kahuna"
 
@@ -86,6 +96,36 @@ func pdbName(cluster *kahunav1alpha1.KahunaCluster) string { return cluster.Name
 
 // certificateName is the cert-manager Certificate and the Secret it writes.
 func certificateName(cluster *kahunav1alpha1.KahunaCluster) string { return cluster.Name + "-tls" }
+
+// backupClaimName is the PersistentVolumeClaim holding the backups: the user's own claim, or the
+// one the operator creates from spec.backup.volume.claim.
+func backupClaimName(cluster *kahunav1alpha1.KahunaCluster) string {
+	if v := cluster.Spec.Backup.Volume; v.ClaimName != nil {
+		return *v.ClaimName
+	}
+	return cluster.Name + "-backup"
+}
+
+// backupMACSecretName is the Secret the operator generates when no MAC key is supplied.
+func backupMACSecretName(cluster *kahunav1alpha1.KahunaCluster) string {
+	return cluster.Name + "-backup-mac"
+}
+
+// backupPath is the server's backup directory. It is a subdirectory of the mount, not the mount
+// itself, for two reasons. Two clusters can then share one claim. And the server refuses a backup
+// directory that is group-writable, which the root of a volume often is (an fsGroup makes it so);
+// a subdirectory that does not exist yet is created by the server with mode 0700.
+func backupPath(cluster *kahunav1alpha1.KahunaCluster) string {
+	return backupMountPath + "/" + cluster.Name
+}
+
+// backupClusterID is the id stamped into every backup.
+func backupClusterID(cluster *kahunav1alpha1.KahunaCluster) string {
+	if id := cluster.Spec.Backup.ClusterID; id != "" {
+		return id
+	}
+	return cluster.Namespace + "/" + cluster.Name
+}
 
 // podName returns the pod name for an ordinal. StatefulSet pod names are stable, which is what
 // makes the ordinal usable as a durable Raft node identity.

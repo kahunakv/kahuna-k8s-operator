@@ -18,9 +18,11 @@ package kahuna
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 )
@@ -194,5 +196,65 @@ func TestPlacementReportsAServerWithoutTheEndpoint(t *testing.T) {
 	_, err := c.Placement(context.Background(), srv.URL)
 	if !errors.Is(err, ErrPlacementUnsupported) {
 		t.Fatalf("a 404 was reported as %v, want ErrPlacementUnsupported", err)
+	}
+}
+
+// A refused backup carries its outcome in a header and in the problem body. The operator decides
+// from the outcome whether another node can take the backup.
+func TestBackupRefusalIsTyped(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/problem+json")
+		w.Header().Set("X-Kahuna-Backup-Outcome", BackupOutcomeNotBackupCoordinator)
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_, _ = w.Write([]byte(`{"status":503,"detail":"This node is not the backup coordinator","outcome":"NotBackupCoordinator"}`))
+	}))
+	t.Cleanup(srv.Close)
+
+	_, err := NewHTTPClient(testReadTimeout, testLeaveTimeout).TakeCoordinatedBackup(context.Background(), srv.URL)
+	var be *BackupError
+	if !errors.As(err, &be) {
+		t.Fatalf("got %v, want a *BackupError", err)
+	}
+	if be.StatusCode != 503 || be.Outcome != BackupOutcomeNotBackupCoordinator || !be.TryAnotherNode() {
+		t.Fatalf("got %+v", be)
+	}
+	if !strings.Contains(be.Error(), "not the backup coordinator") {
+		t.Fatalf("message %q lacks the server's detail", be.Error())
+	}
+}
+
+// A backup is not a status read: a full backup copies the whole store, so it must not carry the
+// short read bound.
+func TestBackupIsNotBoundByTheReadTimeout(t *testing.T) {
+	srv := delayedServer(t, "/v1/backups/coordinated",
+		`{"backupId":"7d9e1c4a-0000-0000-0000-000000000001","type":"Full","parentBackupId":null}`, testServerDelay)
+
+	info, err := NewHTTPClient(testReadTimeout, testLeaveTimeout).TakeCoordinatedBackup(context.Background(), srv.URL)
+	if err != nil {
+		t.Fatalf("TakeCoordinatedBackup: %v", err)
+	}
+	if info.BackupID != "7d9e1c4a-0000-0000-0000-000000000001" || info.Type != BackupTypeFull || info.ParentBackupID != "" {
+		t.Fatalf("got %+v", info)
+	}
+}
+
+func TestIncrementalBackupSendsTheParent(t *testing.T) {
+	var got map[string]string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/backups/incremental" || r.Header.Get("Content-Type") != "application/json" {
+			http.Error(w, "unexpected request", http.StatusBadRequest)
+			return
+		}
+		_ = json.NewDecoder(r.Body).Decode(&got)
+		_, _ = w.Write([]byte(`{"backupId":"b2","type":"Incremental","parentBackupId":"b1"}`))
+	}))
+	t.Cleanup(srv.Close)
+
+	info, err := NewHTTPClient(testReadTimeout, testLeaveTimeout).TakeIncrementalBackup(context.Background(), srv.URL, "b1")
+	if err != nil {
+		t.Fatalf("TakeIncrementalBackup: %v", err)
+	}
+	if got["parentBackupId"] != "b1" || info.BackupID != "b2" || info.ParentBackupID != "b1" {
+		t.Fatalf("sent %v, got %+v", got, info)
 	}
 }

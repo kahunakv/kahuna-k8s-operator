@@ -202,6 +202,25 @@ func podVolumes(cluster *kahunav1alpha1.KahunaCluster) []corev1.Volume {
 			},
 		})
 	}
+
+	if cluster.Spec.Backup != nil {
+		mac := backupMACKeyRef(cluster)
+		vols = append(vols, corev1.Volume{
+			Name: backupVolumeName,
+			VolumeSource: corev1.VolumeSource{
+				PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: backupClaimName(cluster)},
+			},
+		}, corev1.Volume{
+			Name: backupMACVolumeName,
+			VolumeSource: corev1.VolumeSource{
+				Secret: &corev1.SecretVolumeSource{
+					SecretName:  mac.Name,
+					Items:       []corev1.KeyToPath{{Key: mac.Key, Path: backupMACFileName}},
+					DefaultMode: ptr.To(int32(0o400)),
+				},
+			},
+		})
+	}
 	return vols
 }
 
@@ -231,7 +250,26 @@ func podVolumeMounts(cluster *kahunav1alpha1.KahunaCluster) []corev1.VolumeMount
 			Name: tlsPasswordVolumeName, MountPath: tlsPasswordMountPath, ReadOnly: true,
 		})
 	}
+	if cluster.Spec.Backup != nil {
+		mounts = append(mounts,
+			corev1.VolumeMount{Name: backupVolumeName, MountPath: backupMountPath},
+			corev1.VolumeMount{Name: backupMACVolumeName, MountPath: backupMACMountPath, ReadOnly: true},
+		)
+	}
 	return mounts
+}
+
+// desiredBackupClaim builds the claim the operator creates from spec.backup.volume.claim.
+// ReadWriteMany is the default because every node mounts it at once.
+func desiredBackupClaim(cluster *kahunav1alpha1.KahunaCluster) *corev1.PersistentVolumeClaim {
+	spec := *cluster.Spec.Backup.Volume.Claim
+	if len(spec.AccessModes) == 0 {
+		spec.AccessModes = []corev1.PersistentVolumeAccessMode{corev1.ReadWriteMany}
+	}
+	pvc := volumeClaim(backupClaimName(cluster), spec)
+	pvc.Namespace = cluster.Namespace
+	pvc.Labels = podLabels(cluster)
+	return &pvc
 }
 
 // desiredStatefulSet builds the StatefulSet backing the cluster.
