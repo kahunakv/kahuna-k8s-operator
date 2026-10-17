@@ -22,6 +22,7 @@
   - ""
   resources:
   - persistentvolumeclaims
+  - secrets
   verbs:
   - create
   - delete
@@ -33,15 +34,6 @@
   resources:
   - pods
   verbs:
-  - get
-  - list
-  - watch
-- apiGroups:
-  - ""
-  resources:
-  - secrets
-  verbs:
-  - create
   - get
   - list
   - watch

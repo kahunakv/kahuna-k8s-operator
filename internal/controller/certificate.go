@@ -20,7 +20,9 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/base64"
+	"errors"
 	"fmt"
+	"strings"
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -28,7 +30,10 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+	logf "sigs.k8s.io/controller-runtime/pkg/log"
+	"software.sslmate.com/src/go-pkcs12"
 
 	kahunav1alpha1 "github.com/kahunakv/k8s-operator/api/v1alpha1"
 )
@@ -46,6 +51,10 @@ var certManagerGVK = schema.GroupVersionKind{
 // certManagerKeystoreKey is the key cert-manager writes a PKCS#12 keystore under. It is fixed by
 // cert-manager, not configurable.
 const certManagerKeystoreKey = "keystore.p12"
+
+// certManagerCertificateAnnotation is set by cert-manager on every Secret it issues and names the
+// Certificate the Secret belongs to.
+const certManagerCertificateAnnotation = "cert-manager.io/certificate-name"
 
 // keystorePasswordKey is the key inside the generated password Secret.
 const keystorePasswordKey = "password"
@@ -78,15 +87,15 @@ func tlsPasswordRef(cluster *kahunav1alpha1.KahunaCluster) *corev1.SecretKeySele
 // and each rewrite reissues the certificate and restarts the nodes that mount it.
 func certificateDNSNames(cluster *kahunav1alpha1.KahunaCluster) []string {
 	peer := peerServiceName(cluster)
-	client := clientServiceName(cluster)
+	svc := clientServiceName(cluster)
 	ns := cluster.Namespace
 	return []string{
 		fmt.Sprintf("*.%s.%s.svc.cluster.local", peer, ns),
 		fmt.Sprintf("%s.%s.svc.cluster.local", peer, ns),
-		fmt.Sprintf("%s.%s.svc.cluster.local", client, ns),
-		fmt.Sprintf("%s.%s.svc", client, ns),
-		fmt.Sprintf("%s.%s", client, ns),
-		client,
+		fmt.Sprintf("%s.%s.svc.cluster.local", svc, ns),
+		fmt.Sprintf("%s.%s.svc", svc, ns),
+		fmt.Sprintf("%s.%s", svc, ns),
+		svc,
 	}
 }
 
@@ -206,11 +215,96 @@ func (r *KahunaClusterReconciler) reconcileCertificate(ctx context.Context, clus
 	if err != nil && apimeta.IsNoMatchError(err) {
 		return fmt.Errorf("spec.tls.certManager is set but cert-manager is not installed in this cluster: %w", err)
 	}
-	return err
+	if err != nil {
+		return err
+	}
+	return r.replaceStaleKeystore(ctx, cluster)
+}
+
+// replaceStaleKeystore deletes a cert-manager keystore Secret that its password cannot open, so
+// that cert-manager issues a new one.
+//
+// cert-manager does not reissue a keystore when its password changes. Recreating a KahunaCluster
+// under the same name causes exactly that: the cluster owns the password Secret, so the password is
+// collected with it and generated anew, while cert-manager sets no owner on the keystore Secret.
+// That Secret outlives the cluster, still satisfies the recreated Certificate, and every pod then
+// fails to open it.
+//
+// The keystore is tested with the password exactly as cert-manager reads it, so a reissue always
+// cures the mismatch and the delete cannot repeat. Only a Secret cert-manager issued for this
+// cluster's Certificate is deleted; anything else is left for its owner.
+func (r *KahunaClusterReconciler) replaceStaleKeystore(ctx context.Context, cluster *kahunav1alpha1.KahunaCluster) error {
+	if cluster.Spec.TLS.CertManager == nil {
+		return nil
+	}
+	k, err := r.readKeystore(ctx, cluster)
+	if err != nil || k == nil {
+		return err
+	}
+	if k.secret.Annotations[certManagerCertificateAnnotation] != certificateName(cluster) || k.opensWith(string(k.password)) {
+		return nil
+	}
+
+	// The preconditions pin the delete to the Secret just tested: if cert-manager rewrote it in
+	// the meantime, the new keystore is left alone.
+	err = r.Delete(ctx, k.secret, client.Preconditions{UID: &k.secret.UID, ResourceVersion: &k.secret.ResourceVersion})
+	if apierrors.IsNotFound(err) || apierrors.IsConflict(err) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("deleting stale keystore Secret: %w", err)
+	}
+	logf.FromContext(ctx).Info("Deleted keystore Secret its password could not open, for cert-manager to reissue",
+		"secret", k.secret.Name, "passwordSecret", tlsPasswordRef(cluster).Name)
+	return nil
+}
+
+// keystoreMaterial is the keystore Secret and the password meant to open it.
+type keystoreMaterial struct {
+	secret   *corev1.Secret
+	keystore []byte
+	password []byte
+}
+
+// readKeystore fetches the keystore and its password. It returns nil when either is missing,
+// which leaves nothing to test yet.
+func (r *KahunaClusterReconciler) readKeystore(ctx context.Context, cluster *kahunav1alpha1.KahunaCluster) (*keystoreMaterial, error) {
+	ref := tlsPasswordRef(cluster)
+	if ref == nil {
+		return nil, nil
+	}
+
+	secret := &corev1.Secret{}
+	if err := r.Get(ctx, types.NamespacedName{Name: tlsSecretName(cluster), Namespace: cluster.Namespace}, secret); err != nil {
+		return nil, client.IgnoreNotFound(err)
+	}
+	keystore, ok := secret.Data[keystoreKey(cluster)]
+	if !ok {
+		return nil, nil
+	}
+
+	pw := &corev1.Secret{}
+	if err := r.Get(ctx, types.NamespacedName{Name: ref.Name, Namespace: cluster.Namespace}, pw); err != nil {
+		return nil, client.IgnoreNotFound(err)
+	}
+	password, ok := pw.Data[ref.Key]
+	if !ok {
+		return nil, nil
+	}
+	return &keystoreMaterial{secret: secret, keystore: keystore, password: password}, nil
+}
+
+// opensWith reports whether password opens the keystore. Only a wrong password counts as a
+// failure: a keystore this code cannot parse is assumed to be fine, so nothing is deleted or
+// reported on a guess.
+func (k *keystoreMaterial) opensWith(password string) bool {
+	_, _, _, err := pkcs12.DecodeChain(k.keystore, password)
+	return !errors.Is(err, pkcs12.ErrIncorrectPassword)
 }
 
 // certificateReady reports whether cert-manager has issued the keystore. Until it has, the Secret
 // the pods mount does not exist and the StatefulSet would sit unschedulable with no explanation.
+// A keystore the pods' password cannot open is not ready either: every node would crash-loop on it.
 func (r *KahunaClusterReconciler) certificateReady(ctx context.Context, cluster *kahunav1alpha1.KahunaCluster) (bool, string) {
 	secret := &corev1.Secret{}
 	err := r.Get(ctx, types.NamespacedName{Name: tlsSecretName(cluster), Namespace: cluster.Namespace}, secret)
@@ -224,8 +318,20 @@ func (r *KahunaClusterReconciler) certificateReady(ctx context.Context, cluster 
 	if _, ok := secret.Data[key]; !ok {
 		return false, fmt.Sprintf("Secret %q has no %q key", tlsSecretName(cluster), key)
 	}
+
+	k, err := r.readKeystore(ctx, cluster)
+	if err != nil {
+		return false, err.Error()
+	}
+	// The pods read the password through "$(cat ...)", which drops trailing newlines, so the
+	// keystore is tested with the password as they will see it.
+	if k != nil && !k.opensWith(strings.TrimRight(string(k.password), "\n")) {
+		return false, fmt.Sprintf("keystore in Secret %q does not open with the password in Secret %q",
+			tlsSecretName(cluster), tlsPasswordRef(cluster).Name)
+	}
 	return true, ""
 }
 
-// conditionKeystoreReady reports whether the PKCS#12 keystore the pods mount exists yet.
+// conditionKeystoreReady reports whether the PKCS#12 keystore the pods mount exists yet and opens
+// with the password they are given.
 const conditionKeystoreReady = "KeystoreReady"
