@@ -805,6 +805,19 @@ type BackupStatus struct {
 	// lastFailureMessage is why the latest failed backup failed.
 	// +optional
 	LastFailureMessage string `json:"lastFailureMessage,omitempty"`
+
+	// unclaimedSince is when the first of the current run of unclaimed attempts ended. An attempt
+	// is unclaimed when no node took it and every node refused with an outcome that clears on its
+	// own once the meta partition has a settled leader. This is what a cluster looks like right
+	// after bootstrap. An unclaimed attempt is retried soon and is not counted as a failure, until
+	// the run lasts longer than a bound. Cleared by any other result.
+	// +optional
+	UnclaimedSince *metav1.Time `json:"unclaimedSince,omitempty"`
+
+	// lastUnclaimedTime is when the latest unclaimed attempt ended. The next attempt waits a short
+	// delay after it.
+	// +optional
+	LastUnclaimedTime *metav1.Time `json:"lastUnclaimedTime,omitempty"`
 }
 
 // KahunaClusterStatus defines the observed state of a Kahuna cluster.

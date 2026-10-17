@@ -2494,6 +2494,21 @@ spec:
                       type completed.
                     format: date-time
                     type: string
+                  lastUnclaimedTime:
+                    description: |-
+                      lastUnclaimedTime is when the latest unclaimed attempt ended. The next attempt waits a short
+                      delay after it.
+                    format: date-time
+                    type: string
+                  unclaimedSince:
+                    description: |-
+                      unclaimedSince is when the first of the current run of unclaimed attempts ended. An attempt
+                      is unclaimed when no node took it and every node refused with an outcome that clears on its
+                      own once the meta partition has a settled leader. This is what a cluster looks like right
+                      after bootstrap. An unclaimed attempt is retried soon and is not counted as a failure, until
+                      the run lasts longer than a bound. Cleared by any other result.
+                    format: date-time
+                    type: string
                 type: object
               bootstrapSize:
                 description: |-

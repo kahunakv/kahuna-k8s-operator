@@ -230,6 +230,12 @@ after that each kind runs on its own schedule, and missed runs collapse into one
   failures. The `BackupFailing` condition is true while the latest attempt failed. A failed backup
   stays due and is retried after a backoff (1 minute, doubling to 30). If an incremental's parent is
   gone from the catalog, a new chain starts with a full backup at once.
+- **A steady cluster can still have no backup coordinator.** Right after bootstrap no node leads the
+  meta partition yet, so every node can refuse the first backup (`NotBackupCoordinator`, or
+  `CutUnverified` from the node that just took the lead). When every refusal is of that kind, the
+  backup is retried after 15 seconds and is not counted as a failure: `BackupFailing` stays false
+  with reason `BackupWaiting`, and `status.backup.unclaimedSince` shows since when. Only if no node
+  takes it for 5 minutes is it counted as a failure, with the usual backoff.
 - **Retention** maps to `--backup-retention-*`. The server deletes whole chains and always keeps the
   newest one. The periodic GC pass is turned off (`--backup-gc-interval 0`): its orphan sweep would
   delete a backup that another node has in progress on the shared volume. GC still runs after each

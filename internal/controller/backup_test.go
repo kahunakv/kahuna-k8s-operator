@@ -219,6 +219,90 @@ func TestBackupReportsEveryNodeWhenNoneTakesIt(t *testing.T) {
 	}
 }
 
+// Right after bootstrap no node leads the meta partition: every node refuses, or the one that just
+// took the lead cannot verify its first cut. That is reported as unclaimed, not as a plain failure.
+func TestBackupRefusedOnlyForWantOfALeaderIsUnclaimed(t *testing.T) {
+	notLeader := &kahuna.BackupError{StatusCode: 503, Outcome: kahuna.BackupOutcomeNotBackupCoordinator}
+	cut := &kahuna.BackupError{StatusCode: 503, Outcome: kahuna.BackupOutcomeCutUnverified}
+	c := &scriptedBackups{answers: map[string]error{"a": notLeader, "b": cut, "c": notLeader}}
+
+	_, err := runBackup(context.Background(), c, backupFull, "", targets("a", "b", "c"))
+	var unclaimed *unclaimedBackupError
+	if !errors.As(err, &unclaimed) || !strings.Contains(err.Error(), "b: ") {
+		t.Fatalf("got %v, want an unclaimed backup that names every refusal", err)
+	}
+}
+
+// A node that could not be reached, or one without the backup flags, is not a leader election. The
+// result is a plain failure.
+func TestBackupRefusedForAnotherCauseIsNotUnclaimed(t *testing.T) {
+	notLeader := &kahuna.BackupError{StatusCode: 503, Outcome: kahuna.BackupOutcomeNotBackupCoordinator}
+	notConfigured := &kahuna.BackupError{StatusCode: 503, Outcome: kahuna.BackupOutcomeNotConfigured}
+	for name, other := range map[string]error{"unreachable": errors.New("connection refused"), "not configured": notConfigured} {
+		c := &scriptedBackups{answers: map[string]error{"a": notLeader, "b": other}}
+		_, err := runBackup(context.Background(), c, backupFull, "", targets("a", "b"))
+		var unclaimed *unclaimedBackupError
+		if err == nil || errors.As(err, &unclaimed) {
+			t.Fatalf("%s: got %v, want a plain failure", name, err)
+		}
+	}
+}
+
+// An unclaimed backup stays due, is not counted, and goes out again after a short delay instead of
+// the failure backoff.
+func TestUnclaimedBackupIsRetriedSoonWithoutAFailure(t *testing.T) {
+	full := mustSchedule(t, "0 2 * * *")
+	st := &kahunav1alpha1.BackupStatus{}
+	job := backupJob{kind: backupFull, scheduled: t0, err: &unclaimedBackupError{refusals: []string{"a: x"}}}
+	applyBackupResult(st, job, t0, logr.Discard())
+
+	if st.ConsecutiveFailures != 0 || st.LastFailureTime != nil || st.LastFullScheduleTime != nil {
+		t.Fatalf("status after an unclaimed backup: %+v", st)
+	}
+	if !st.UnclaimedSince.Time.Equal(t0) || !st.LastUnclaimedTime.Time.Equal(t0) {
+		t.Fatalf("unclaimed times: since %v, last %v", st.UnclaimedSince, st.LastUnclaimedTime)
+	}
+	d := decideBackup(backupInput{full: full, status: *st, now: t0.Add(time.Second)})
+	if d.kind != backupNone || !d.retryAt.Equal(t0.Add(unclaimedRetryDelay)) {
+		t.Fatalf("got %+v, want the retry held until %v", d, t0.Add(unclaimedRetryDelay))
+	}
+	if d := decideBackup(backupInput{full: full, status: *st, now: t0.Add(unclaimedRetryDelay)}); d.kind != backupFull {
+		t.Fatalf("got %+v, want the full backup again after the delay", d)
+	}
+
+	// A later unclaimed attempt keeps the start of the run.
+	applyBackupResult(st, job, t0.Add(time.Minute), logr.Discard())
+	if !st.UnclaimedSince.Time.Equal(t0) || !st.LastUnclaimedTime.Time.Equal(t0.Add(time.Minute)) || st.ConsecutiveFailures != 0 {
+		t.Fatalf("status after a second unclaimed backup: %+v", st)
+	}
+
+	// Success ends the run.
+	applyBackupResult(st, backupJob{kind: backupFull, scheduled: t0, info: &kahuna.BackupInfo{BackupID: "b1"}}, t0.Add(2*time.Minute), logr.Discard())
+	if st.UnclaimedSince != nil || st.LastUnclaimedTime != nil {
+		t.Fatalf("status after success: %+v", st)
+	}
+}
+
+// A cluster that never gets a backup coordinator is still reported, once the bound is reached.
+func TestUnclaimedBackupFailsAfterTheBound(t *testing.T) {
+	st := &kahunav1alpha1.BackupStatus{UnclaimedSince: at(0), LastUnclaimedTime: at(4 * time.Minute)}
+	job := backupJob{kind: backupFull, scheduled: t0, err: &unclaimedBackupError{refusals: []string{"a: x"}}}
+	applyBackupResult(st, job, t0.Add(unclaimedFailAfter), logr.Discard())
+
+	if st.ConsecutiveFailures != 1 || st.LastFailureTime == nil || !strings.Contains(st.LastFailureMessage, "a: x") {
+		t.Fatalf("status after the bound: %+v", st)
+	}
+	if st.UnclaimedSince != nil || st.LastUnclaimedTime != nil {
+		t.Fatalf("unclaimed times not cleared: %+v", st)
+	}
+
+	// From here an unclaimed attempt counts like any other failure, with the backoff.
+	applyBackupResult(st, job, t0.Add(10*time.Minute), logr.Discard())
+	if st.ConsecutiveFailures != 2 || st.UnclaimedSince != nil {
+		t.Fatalf("status after an unclaimed backup with a failure outstanding: %+v", st)
+	}
+}
+
 func TestSuccessfulFullBackupAdvancesBothAnchors(t *testing.T) {
 	st := &kahunav1alpha1.BackupStatus{ConsecutiveFailures: 2, LastFailureTime: at(-time.Hour), LastFailureMessage: "x"}
 	job := backupJob{kind: backupFull, scheduled: t0, info: &kahuna.BackupInfo{BackupID: "b1", Type: kahuna.BackupTypeFull}}

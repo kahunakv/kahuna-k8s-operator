@@ -20,6 +20,7 @@ import (
 	"context"
 	"fmt"
 	"sync"
+	"time"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
@@ -913,6 +914,51 @@ var _ = Describe("KahunaCluster Controller", func() {
 			// Within the backoff nothing is sent.
 			fake := reconcileUsing(&fakeKahuna{membership: rosterOf(cluster, 3)})
 			Consistently(fake.calls, "200ms").Should(BeEmpty())
+		})
+
+		// The reported failure: the cluster is steady before any node leads the meta partition, so the
+		// first backup was refused by every node and showed as BackupFailing for a minute.
+		It("does not report a backup that no node takes for want of a meta-partition leader", func() {
+			reconcileWith(rosterOf(cluster, 3), nil)
+			enableBackups()
+			reconcileWith(rosterOf(cluster, 3), nil)
+			rollOut()
+			bindBackupClaim()
+
+			noLeader := &fakeKahuna{membership: rosterOf(cluster, 3), backup: func(string) (*kahuna.BackupInfo, error) {
+				return nil, &kahuna.BackupError{StatusCode: 503, Outcome: kahuna.BackupOutcomeNotBackupCoordinator}
+			}}
+			reconcileUsing(noLeader)
+			Eventually(noLeader.calls).Should(HaveLen(3))
+			Eventually(func() *metav1.Time {
+				reconcileUsing(&fakeKahuna{membership: rosterOf(cluster, 3)})
+				return getCluster().Status.Backup.UnclaimedSince
+			}).ShouldNot(BeNil())
+
+			out := getCluster()
+			Expect(out.Status.Backup.ConsecutiveFailures).To(BeZero())
+			Expect(out.Status.Backup.LastFailureTime).To(BeNil())
+			failing := apimeta.FindStatusCondition(out.Status.Conditions, kahunav1alpha1.ConditionBackupFailing)
+			Expect(failing.Status).To(Equal(metav1.ConditionFalse))
+			Expect(failing.Reason).To(Equal("BackupWaiting"))
+			Expect(failing.Message).To(ContainSubstring("meta partition"))
+
+			// The retry waits the short delay, not the failure backoff.
+			fake := reconcileUsing(&fakeKahuna{membership: rosterOf(cluster, 3)})
+			Consistently(fake.calls, "200ms").Should(BeEmpty())
+
+			obj := getCluster()
+			obj.Status.Backup.LastUnclaimedTime = ptr.To(metav1.NewTime(time.Now().Add(-unclaimedRetryDelay)))
+			Expect(k8sClient.Status().Update(ctx, obj)).To(Succeed())
+			fake = reconcileUsing(&fakeKahuna{membership: rosterOf(cluster, 3)})
+			Eventually(fake.calls).Should(HaveLen(1))
+			Eventually(func() string {
+				reconcileUsing(&fakeKahuna{membership: rosterOf(cluster, 3)})
+				return getCluster().Status.Backup.LastBackupID
+			}).Should(Equal("backup-1"))
+			st := getCluster().Status.Backup
+			Expect(st.UnclaimedSince).To(BeNil())
+			Expect(st.ConsecutiveFailures).To(BeZero())
 		})
 
 		It("drops the backup state when backups are turned off", func() {

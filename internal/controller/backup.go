@@ -60,6 +60,15 @@ const (
 	backupRetryInitial = time.Minute
 	backupRetryMax     = 30 * time.Minute
 
+	// unclaimedRetryDelay is how long a backup that no node took waits before it is sent again,
+	// when every node refused it with an outcome that clears on retry. Right after bootstrap no
+	// node leads the meta partition yet, and the election ends in seconds, so the full backoff
+	// would only delay the first backup.
+	unclaimedRetryDelay = 15 * time.Second
+	// unclaimedFailAfter is how long unclaimed attempts go on before one is counted as a failure.
+	// Without it, a cluster that never gets a backup coordinator would never report BackupFailing.
+	unclaimedFailAfter = 5 * time.Minute
+
 	// maxMissedSchedules bounds the walk from an old schedule time to the latest one that is due.
 	// One run covers any number of missed ones, as with a CronJob.
 	maxMissedSchedules = 100000
@@ -350,7 +359,11 @@ func (b *backupRunner) start(key types.NamespacedName, job *backupJob, timeout t
 		ctx, cancel := context.WithTimeout(context.Background(), timeout)
 		defer cancel()
 		info, err := fn(ctx)
-		if err != nil {
+		var unclaimed *unclaimedBackupError
+		switch {
+		case errors.As(err, &unclaimed):
+			log.Info("No node took the backup", "kind", job.kind, "refusals", err.Error())
+		case err != nil:
 			log.Error(err, "Backup failed", "kind", job.kind)
 		}
 
@@ -432,8 +445,15 @@ func decideBackup(in backupInput) backupDecision {
 		}
 	}
 
-	if d.kind != backupNone && st.ConsecutiveFailures > 0 && st.LastFailureTime != nil {
-		if retryAt := st.LastFailureTime.Add(backupRetryDelay(st.ConsecutiveFailures)); retryAt.After(in.now) {
+	if d.kind != backupNone {
+		var retryAt time.Time
+		switch {
+		case st.ConsecutiveFailures > 0 && st.LastFailureTime != nil:
+			retryAt = st.LastFailureTime.Add(backupRetryDelay(st.ConsecutiveFailures))
+		case st.LastUnclaimedTime != nil:
+			retryAt = st.LastUnclaimedTime.Add(unclaimedRetryDelay)
+		}
+		if retryAt.After(in.now) {
 			d.kind, d.scheduled = backupNone, time.Time{}
 			d.retryAt, d.next = retryAt, retryAt
 		}
@@ -531,14 +551,30 @@ type backupTarget struct {
 	url string
 }
 
+// unclaimedBackupError is a backup that no node took, where every node refused with an outcome
+// that clears on retry. It is what a cluster with no meta-partition leader yet returns.
+type unclaimedBackupError struct {
+	refusals []string
+}
+
+func (e *unclaimedBackupError) Error() string {
+	return "no node took the backup: " + strings.Join(e.refusals, "; ")
+}
+
 // runBackup sends the backup to each node in turn until one takes it.
 //
 // Only the meta-partition leader takes a coordinated backup, and the operator has no cheap way to
 // ask which node that is: the leader query is behind the Raft node authentication. Every other node
 // refuses at once with NotBackupCoordinator, so asking each node in turn costs one fast refusal per
 // node that is not the leader.
+//
+// The cluster is steady before a backup is sent, but that does not mean the meta partition has a
+// leader: right after bootstrap every node can refuse with NotBackupCoordinator, or the node that
+// just took the lead with CutUnverified. When every refusal is of that kind, the result is an
+// *unclaimedBackupError.
 func runBackup(ctx context.Context, c kahuna.Client, kind backupKind, parent string, targets []backupTarget) (*kahuna.BackupInfo, error) {
 	var refusals []string
+	clears := true
 	for _, t := range targets {
 		var info *kahuna.BackupInfo
 		var err error
@@ -554,14 +590,19 @@ func runBackup(ctx context.Context, c kahuna.Client, kind backupKind, parent str
 			return nil, fmt.Errorf("%s did not finish the backup before the timeout: %w", t.pod, err)
 		}
 		var be *kahuna.BackupError
-		if errors.As(err, &be) && !be.TryAnotherNode() {
+		refused := errors.As(err, &be)
+		if refused && !be.TryAnotherNode() {
 			return nil, fmt.Errorf("%s: %w", t.pod, err)
 		}
 		// A refusal another node may not repeat, or a node that could not be reached.
+		clears = clears && refused && be.ClearsOnRetry()
 		refusals = append(refusals, fmt.Sprintf("%s: %v", t.pod, err))
 	}
 	if len(refusals) == 0 {
 		return nil, errors.New("no ready node to send the backup to")
+	}
+	if clears {
+		return nil, &unclaimedBackupError{refusals: refusals}
 	}
 	return nil, fmt.Errorf("no node took the backup: %s", strings.Join(refusals, "; "))
 }
@@ -580,6 +621,7 @@ func applyBackupResult(st *kahunav1alpha1.BackupStatus, job backupJob, now time.
 		st.ConsecutiveFailures = 0
 		st.LastFailureTime = nil
 		st.LastFailureMessage = ""
+		st.UnclaimedSince, st.LastUnclaimedTime = nil, nil
 		scheduled := metav1.NewTime(job.scheduled)
 		if job.kind == backupFull {
 			st.LastFullScheduleTime = &scheduled
@@ -593,6 +635,23 @@ func applyBackupResult(st *kahunav1alpha1.BackupStatus, job backupJob, now time.
 			"substitutionReason", job.info.SubstitutionReason)
 		return
 	}
+
+	// No node took the backup, and only because the meta partition has no settled leader yet. This
+	// is not a failure until it lasts longer than the bound: the backup stays due and goes out again
+	// after a short delay. While earlier failures are outstanding, it counts like any other failure.
+	var unclaimed *unclaimedBackupError
+	if errors.As(job.err, &unclaimed) && st.ConsecutiveFailures == 0 {
+		if st.UnclaimedSince == nil {
+			st.UnclaimedSince = &at
+		}
+		if now.Sub(st.UnclaimedSince.Time) < unclaimedFailAfter {
+			st.LastUnclaimedTime = &at
+			return
+		}
+		log.Info("No node took the backup within the bound, counting it as a failure",
+			"kind", job.kind, "unclaimedSince", st.UnclaimedSince.Time, "bound", unclaimedFailAfter)
+	}
+	st.UnclaimedSince, st.LastUnclaimedTime = nil, nil
 
 	var be *kahuna.BackupError
 	if job.kind == backupIncremental && errors.As(job.err, &be) && be.Outcome == kahuna.BackupOutcomeParentMissing {
@@ -678,6 +737,13 @@ func (r *KahunaClusterReconciler) reconcileBackup(ctx context.Context, cluster *
 	}
 
 	d := decideBackup(backupInput{full: full, incremental: incremental, status: *st, now: now})
+	if d.kind == backupNone && !d.retryAt.IsZero() && !failing && st.UnclaimedSince != nil {
+		setBackupCondition(cluster, false, "BackupWaiting", fmt.Sprintf(
+			"a backup is due, but no node has taken it since %s: every node refused it with an outcome that clears "+
+				"once the meta partition has a settled leader. Retrying at %s",
+			st.UnclaimedSince.UTC().Format(time.RFC3339), d.retryAt.UTC().Format(time.RFC3339)))
+		return untilDue(d.next, now)
+	}
 	if d.kind == backupNone {
 		msg := "no backup is scheduled"
 		switch {

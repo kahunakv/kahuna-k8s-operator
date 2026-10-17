@@ -277,6 +277,18 @@ func (e *BackupError) TryAnotherNode() bool {
 	return false
 }
 
+// ClearsOnRetry reports whether the same request can succeed later with nothing changed: the
+// refusal comes from a meta partition with no leader yet, a leader that just moved, or a cut that
+// the transactions in flight overtook. NotConfigured is not one of these: it needs a restart with
+// the backup flags.
+func (e *BackupError) ClearsOnRetry() bool {
+	switch e.Outcome {
+	case BackupOutcomeNotBackupCoordinator, BackupOutcomeRetryableLeadershipLoss, BackupOutcomeCutUnverified:
+		return true
+	}
+	return false
+}
+
 // Client reads cluster state from a Kahuna node, and asks one to decommission itself.
 type Client interface {
 	// Membership returns the committed roster as seen by the node at baseURL.
