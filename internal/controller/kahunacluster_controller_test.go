@@ -805,6 +805,28 @@ var _ = Describe("KahunaCluster Controller", func() {
 			}
 		}
 
+		backupClaimKey := func() types.NamespacedName {
+			return types.NamespacedName{Name: name + "-backup", Namespace: namespace}
+		}
+		getBackupClaim := func() *corev1.PersistentVolumeClaim {
+			pvc := &corev1.PersistentVolumeClaim{}
+			Expect(k8sClient.Get(ctx, backupClaimKey(), pvc)).To(Succeed())
+			return pvc
+		}
+
+		// bindBackupClaim stands in for the volume controller, which envtest does not run either.
+		bindBackupClaim := func() {
+			pvc := getBackupClaim()
+			pvc.Status.Phase = corev1.ClaimBound
+			pvc.Status.AccessModes = pvc.Spec.AccessModes
+			pvc.Status.Capacity = pvc.Spec.Resources.Requests
+			Expect(k8sClient.Status().Update(ctx, pvc)).To(Succeed())
+		}
+
+		volumeCondition := func() *metav1.Condition {
+			return apimeta.FindStatusCondition(getCluster().Status.Conditions, kahunav1alpha1.ConditionBackupVolumeReady)
+		}
+
 		It("creates the shared claim and the signing key, and keeps both when the cluster is deleted", func() {
 			enableBackups()
 			reconcileWith(rosterOf(cluster, 3), nil)
@@ -846,8 +868,10 @@ var _ = Describe("KahunaCluster Controller", func() {
 			Expect(failing.Reason).To(Equal("BackupWaiting"))
 
 			rollOut()
+			bindBackupClaim()
 			fake = reconcileUsing(&fakeKahuna{membership: rosterOf(cluster, 3)})
 			Eventually(fake.calls).Should(HaveLen(1))
+			Expect(volumeCondition().Status).To(Equal(metav1.ConditionTrue))
 
 			// The next pass collects the result from the background runner.
 			Eventually(func() string {
@@ -869,6 +893,7 @@ var _ = Describe("KahunaCluster Controller", func() {
 			enableBackups()
 			reconcileWith(rosterOf(cluster, 3), nil)
 			rollOut()
+			bindBackupClaim()
 
 			refuse := &fakeKahuna{membership: rosterOf(cluster, 3), backup: func(string) (*kahuna.BackupInfo, error) {
 				return nil, &kahuna.BackupError{StatusCode: 422, Outcome: "IoError", Detail: "disk full"}
@@ -903,9 +928,120 @@ var _ = Describe("KahunaCluster Controller", func() {
 			out := getCluster()
 			Expect(out.Status.Backup).To(BeNil())
 			Expect(apimeta.FindStatusCondition(out.Status.Conditions, kahunav1alpha1.ConditionBackupFailing)).To(BeNil())
+			Expect(apimeta.FindStatusCondition(out.Status.Conditions, kahunav1alpha1.ConditionBackupVolumeReady)).To(BeNil())
 			// The claim stays: it holds the backups.
 			pvc := &corev1.PersistentVolumeClaim{}
 			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name + "-backup", Namespace: namespace}, pvc)).To(Succeed())
+		})
+
+		// The reported failure: on a StorageClass without ReadWriteMany the claim never binds, every
+		// pod waits on it, and the only visible state was a cluster stuck in bootstrap.
+		It("names the cause when the backup claim cannot be provisioned, and replaces it when the spec changes", func() {
+			enableBackups()
+			reconcileWith(rosterOf(cluster, 3), nil)
+
+			cond := volumeCondition()
+			Expect(cond).NotTo(BeNil())
+			Expect(cond.Status).To(Equal(metav1.ConditionFalse))
+			Expect(cond.Reason).To(Equal("ClaimPending"))
+
+			pvc := getBackupClaim()
+			Expect(k8sClient.Create(ctx, &corev1.Event{
+				ObjectMeta: metav1.ObjectMeta{Name: name + "-backup.provisioning", Namespace: namespace},
+				InvolvedObject: corev1.ObjectReference{
+					Kind: "PersistentVolumeClaim", APIVersion: "v1",
+					Name: pvc.Name, Namespace: namespace, UID: pvc.UID,
+				},
+				Type:   corev1.EventTypeWarning,
+				Reason: "ProvisioningFailed",
+				Message: `failed to provision volume with StorageClass "standard": ` +
+					`NodePath only supports ReadWriteOnce and ReadWriteOncePod (1.22+) access modes`,
+				Source:         corev1.EventSource{Component: "rancher.io/local-path"},
+				FirstTimestamp: metav1.Now(),
+				LastTimestamp:  metav1.Now(),
+				Count:          1,
+			})).To(Succeed())
+			reconcileWith(rosterOf(cluster, 3), nil)
+
+			cond = volumeCondition()
+			Expect(cond.Status).To(Equal(metav1.ConditionFalse))
+			Expect(cond.Reason).To(Equal("ProvisioningFailed"))
+			Expect(cond.Message).To(ContainSubstring("NodePath only supports ReadWriteOnce"))
+			Expect(cond.Message).To(ContainSubstring("asks for ReadWriteMany"))
+			failing := apimeta.FindStatusCondition(getCluster().Status.Conditions, kahunav1alpha1.ConditionBackupFailing)
+			Expect(failing.Reason).To(Equal("BackupWaiting"))
+			Expect(failing.Message).To(ContainSubstring(`PersistentVolumeClaim "` + name + `-backup" is not bound`))
+
+			By("pointing the claim at a class that supports ReadWriteMany")
+			obj := getCluster()
+			obj.Spec.Backup.Volume.Claim.StorageClassName = ptr.To("nfs")
+			Expect(k8sClient.Update(ctx, obj)).To(Succeed())
+			reconcileWith(rosterOf(cluster, 3), nil)
+
+			// The protection finalizer holds the delete until its controller, which envtest does not
+			// run, removes it.
+			old := &corev1.PersistentVolumeClaim{}
+			if err := k8sClient.Get(ctx, backupClaimKey(), old); err == nil {
+				Expect(old.UID).To(Equal(pvc.UID))
+				Expect(old.DeletionTimestamp).NotTo(BeNil())
+				old.Finalizers = nil
+				Expect(k8sClient.Update(ctx, old)).To(Succeed())
+			} else {
+				Expect(apierrors.IsNotFound(err)).To(BeTrue(), "%v", err)
+			}
+			Eventually(func() error {
+				return k8sClient.Get(ctx, backupClaimKey(), &corev1.PersistentVolumeClaim{})
+			}).Should(Satisfy(apierrors.IsNotFound))
+
+			reconcileWith(rosterOf(cluster, 3), nil)
+			replaced := getBackupClaim()
+			Expect(replaced.UID).NotTo(Equal(pvc.UID))
+			Expect(replaced.Spec.StorageClassName).To(Equal(ptr.To("nfs")))
+			// The new claim has no events yet, so the old failure is not reported against it.
+			Expect(volumeCondition().Reason).To(Equal("ClaimPending"))
+
+			bindBackupClaim()
+			reconcileWith(rosterOf(cluster, 3), nil)
+			cond = volumeCondition()
+			Expect(cond.Status).To(Equal(metav1.ConditionTrue))
+			Expect(cond.Reason).To(Equal("ClaimBound"))
+
+			By("keeping a bound claim when the spec changes again")
+			obj = getCluster()
+			obj.Spec.Backup.Volume.Claim.Size = resource.MustParse("50Gi")
+			Expect(k8sClient.Update(ctx, obj)).To(Succeed())
+			reconcileWith(rosterOf(cluster, 3), nil)
+			Expect(getBackupClaim().UID).To(Equal(replaced.UID))
+		})
+
+		It("reports a named backup claim that does not exist or cannot be shared", func() {
+			obj := getCluster()
+			obj.Spec.Backup = &kahunav1alpha1.BackupSpec{
+				Schedule: testBackupSchedule,
+				Volume:   kahunav1alpha1.BackupVolumeSpec{ClaimName: ptr.To(name + "-shared")},
+			}
+			Expect(k8sClient.Update(ctx, obj)).To(Succeed())
+			reconcileWith(rosterOf(cluster, 3), nil)
+			Expect(volumeCondition().Reason).To(Equal("ClaimNotFound"))
+
+			pvc := &corev1.PersistentVolumeClaim{
+				ObjectMeta: metav1.ObjectMeta{Name: name + "-shared", Namespace: namespace},
+				Spec: corev1.PersistentVolumeClaimSpec{
+					AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
+					Resources: corev1.VolumeResourceRequirements{
+						Requests: corev1.ResourceList{corev1.ResourceStorage: resource.MustParse("1Gi")},
+					},
+				},
+			}
+			Expect(k8sClient.Create(ctx, pvc)).To(Succeed())
+			pvc.Status.Phase = corev1.ClaimBound
+			pvc.Status.AccessModes = pvc.Spec.AccessModes
+			Expect(k8sClient.Status().Update(ctx, pvc)).To(Succeed())
+			reconcileWith(rosterOf(cluster, 3), nil)
+
+			cond := volumeCondition()
+			Expect(cond.Status).To(Equal(metav1.ConditionFalse))
+			Expect(cond.Reason).To(Equal("NotReadWriteMany"))
 		})
 
 		It("rejects backups when the cluster can outgrow its replication factor", func() {

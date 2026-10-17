@@ -1143,8 +1143,11 @@ spec:
                       claim:
                         description: |-
                           claim asks the operator to create a PersistentVolumeClaim named <cluster>-backup. Access
-                          modes default to ReadWriteMany. The operator creates the claim once and does not change it
-                          later. Deleting the KahunaCluster, or removing spec.backup, does not delete the claim.
+                          modes default to ReadWriteMany, or to ReadWriteOnce for a single-node cluster, so the
+                          StorageClass must support ReadWriteMany when the cluster has more than one node. Until the
+                          claim binds, the operator replaces it when this spec changes. After it binds, the operator
+                          does not change it. Deleting the KahunaCluster, or removing spec.backup, does not delete the
+                          claim.
                         properties:
                           accessModes:
                             description: accessModes for the claim. Defaults to ReadWriteOnce.

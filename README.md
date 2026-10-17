@@ -234,6 +234,16 @@ after that each kind runs on its own schedule, and missed runs collapse into one
   newest one. The periodic GC pass is turned off (`--backup-gc-interval 0`): its orphan sweep would
   delete a backup that another node has in progress on the shared volume. GC still runs after each
   backup, on the node that took it.
+- **The volume must be ReadWriteMany when the cluster has more than one node.** The operator's
+  `<name>-backup` claim asks for ReadWriteMany, or for ReadWriteOnce on a single-node cluster, where
+  nothing shares it. Most default StorageClasses are block storage and cannot give ReadWriteMany:
+  Kind's `local-path`, EBS, Persistent Disk and Azure Disk among them. Use a file-storage class
+  (NFS, Filestore, EFS, Azure Files, CephFS) or name your own claim in `claimName`. Every pod mounts
+  the claim, so while it is unbound no pod starts and the cluster stays in bootstrap. The
+  `BackupVolumeReady` condition then names the cause, for example the provisioner's
+  `ProvisioningFailed` event. Until the claim binds, the operator replaces it when
+  `volume.claim` changes, so a corrected `storageClassName` takes effect without a manual delete.
+  After it binds, the operator does not change it.
 - **The claim and the signing key outlive the cluster.** Neither the `<name>-backup` claim nor the
   generated `<name>-backup-mac` Secret has an owner reference, so deleting the KahunaCluster or
   removing `backup` keeps both. The server refuses to restore or seed from a signed backup without
@@ -245,6 +255,36 @@ every partition. So `backup` is refused when `replication.factor` is less than t
 cluster can have (`autoscaling.maxReplicas`, or `replicas`). With the factor capped at 3, that leaves
 backups for clusters without a factor, and for clusters of at most 3 nodes. Lifting this needs a
 server change: kahuna feature `5b5461f9` asks for a coordinated backup that covers every partition.
+
+**On a single-node Kind cluster,** whose only class is `local-path`, a hostPath PersistentVolume
+gives a working ReadWriteMany claim. It is correct there only because every pod runs on the one
+node:
+
+```yaml
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: kahuna-backup
+spec:
+  capacity: {storage: 5Gi}
+  accessModes: [ReadWriteMany]
+  storageClassName: manual
+  persistentVolumeReclaimPolicy: Retain
+  hostPath: {path: /var/local/kahuna-backup, type: DirectoryOrCreate}
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: kahuna-backup
+  namespace: kahuna
+spec:
+  accessModes: [ReadWriteMany]
+  storageClassName: manual
+  volumeName: kahuna-backup
+  resources: {requests: {storage: 5Gi}}
+```
+
+Then set `spec.backup.volume.claimName: kahuna-backup`. The e2e suite takes its backups this way.
 
 **Restore is manual for now.** See the
 [server backup guide](https://github.com/kahunakv/kahuna/blob/main/docs/backups-and-point-in-time-recovery-guide.md).

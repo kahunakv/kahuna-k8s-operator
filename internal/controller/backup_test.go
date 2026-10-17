@@ -347,6 +347,81 @@ func TestBackupClaimDefaultsToReadWriteMany(t *testing.T) {
 	}
 }
 
+// Nothing shares a single node's claim, and most StorageClasses cannot provision ReadWriteMany, so
+// a single-node cluster asks for ReadWriteOnce.
+func TestSingleNodeBackupClaimDefaultsToReadWriteOnce(t *testing.T) {
+	c := backupCluster()
+	c.Spec.Replicas = ptr.To(int32(1))
+	if got := desiredBackupClaim(c).Spec.AccessModes; !slices.Equal(got, []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce}) {
+		t.Fatalf("access modes %v, want ReadWriteOnce", got)
+	}
+	c.Spec.Backup.Volume.Claim.AccessModes = []corev1.PersistentVolumeAccessMode{corev1.ReadWriteMany}
+	if got := desiredBackupClaim(c).Spec.AccessModes; !slices.Equal(got, []corev1.PersistentVolumeAccessMode{corev1.ReadWriteMany}) {
+		t.Fatalf("access modes %v, want the spec's", got)
+	}
+}
+
+// An unbound claim holds no data, so it follows the spec. A bound one is never replaced.
+func TestUnboundBackupClaimFollowsTheSpec(t *testing.T) {
+	c := backupCluster()
+	existing := desiredBackupClaim(c)
+	existing.Status.Phase = corev1.ClaimPending
+	// The API server fills in the default class when the spec names none.
+	existing.Spec.StorageClassName = ptr.To("standard")
+
+	if claimNeedsReplacing(existing, desiredBackupClaim(c)) {
+		t.Fatal("replaced a claim that matches the spec")
+	}
+
+	c.Spec.Backup.Volume.Claim.StorageClassName = ptr.To("nfs")
+	if !claimNeedsReplacing(existing, desiredBackupClaim(c)) {
+		t.Fatal("kept a claim with a different storage class")
+	}
+	c.Spec.Backup.Volume.Claim.StorageClassName = ptr.To("standard")
+
+	c.Spec.Backup.Volume.Claim.AccessModes = []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce}
+	if !claimNeedsReplacing(existing, desiredBackupClaim(c)) {
+		t.Fatal("kept a claim with different access modes")
+	}
+	c.Spec.Backup.Volume.Claim.AccessModes = nil
+
+	c.Spec.Backup.Volume.Claim.Size = resource.MustParse("20Gi")
+	if !claimNeedsReplacing(existing, desiredBackupClaim(c)) {
+		t.Fatal("kept a claim with a different size")
+	}
+
+	bound := existing.DeepCopy()
+	bound.Status.Phase = corev1.ClaimBound
+	if claimNeedsReplacing(bound, desiredBackupClaim(c)) {
+		t.Fatal("replaced a bound claim")
+	}
+	prebound := existing.DeepCopy()
+	prebound.Spec.VolumeName = "pv-1"
+	if claimNeedsReplacing(prebound, desiredBackupClaim(c)) {
+		t.Fatal("replaced a claim that has a volume")
+	}
+	deleting := existing.DeepCopy()
+	deleting.DeletionTimestamp = ptr.To(metav1.NewTime(t0))
+	if claimNeedsReplacing(deleting, desiredBackupClaim(c)) {
+		t.Fatal("replaced a claim that is already being deleted")
+	}
+}
+
+// Events written through the events.k8s.io API carry their time in eventTime or series, not in
+// lastTimestamp.
+func TestEventTimeUsesTheNewestField(t *testing.T) {
+	e := &corev1.Event{ObjectMeta: metav1.ObjectMeta{CreationTimestamp: metav1.NewTime(t0)}}
+	if got := eventTime(e); !got.Equal(t0) {
+		t.Fatalf("got %v, want the creation time", got)
+	}
+	e.LastTimestamp = metav1.NewTime(t0.Add(time.Minute))
+	e.EventTime = metav1.NewMicroTime(t0.Add(2 * time.Minute))
+	e.Series = &corev1.EventSeries{LastObservedTime: metav1.NewMicroTime(t0.Add(3 * time.Minute))}
+	if got := eventTime(e); !got.Equal(t0.Add(3 * time.Minute)) {
+		t.Fatalf("got %v, want the series time", got)
+	}
+}
+
 func readyPod(c *kahunav1alpha1.KahunaCluster, ordinal int32, hash string) corev1.Pod {
 	return corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{Name: podName(c, ordinal), Annotations: map[string]string{configHashAnnotation: hash}},

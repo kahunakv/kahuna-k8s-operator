@@ -91,7 +91,11 @@ Image/configuration changes roll pods; topology changes do not restart existing 
 kubectl -n kahuna get kahunacluster kahuna -o jsonpath='{.status.backup}{"\n"}'
 kubectl -n kahuna get kahunacluster kahuna \
   -o jsonpath='{.status.conditions[?(@.type=="BackupFailing")]}{"\n"}'
+kubectl -n kahuna get kahunacluster kahuna \
+  -o jsonpath='{.status.conditions[?(@.type=="BackupVolumeReady")]}{"\n"}'
 ```
+
+If every pod is `Pending` and the cluster stays `Bootstrapping` after `backup` is added, read `BackupVolumeReady`. Every pod mounts the backup claim, so a claim that does not bind stops them all. The usual cause is a StorageClass without ReadWriteMany: the condition then carries the provisioner's `ProvisioningFailed` message. Set `spec.backup.volume.claim.storageClassName` to a class that supports ReadWriteMany. The operator replaces the claim while it is unbound. Alternatively, name a ReadWriteMany claim in `claimName`. The README shows a hostPath volume for single-node Kind.
 
 To pause backups without a rollout, set `spec.backup.suspend: true`. Schedule and suspend changes do not restart pods; every other `backup` field changes the server command line and rolls the cluster. Do not take manual backups against the shared volume while a scheduled one runs: the inline GC after one backup can delete the other's artifacts before its manifest is published.
 

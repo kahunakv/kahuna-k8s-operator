@@ -21,6 +21,8 @@ import (
 	"crypto/rand"
 	"errors"
 	"fmt"
+	"regexp"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -32,6 +34,8 @@ import (
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/utils/ptr"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	kahunav1alpha1 "github.com/kahunakv/k8s-operator/api/v1alpha1"
@@ -90,6 +94,11 @@ func backupMACKeyRef(cluster *kahunav1alpha1.KahunaCluster) corev1.SecretKeySele
 // Neither object gets an owner reference, so neither is deleted with the KahunaCluster. The backups
 // are what is left when the cluster is gone, and the key is what makes them usable: the server
 // refuses to restore or seed from a signed backup without it.
+//
+// The claim is not changed after it binds. Before that it holds no data, so a claim that no longer
+// matches spec.backup.volume.claim is deleted and created again. Without this, a claim that cannot
+// bind (a StorageClass without ReadWriteMany, for example) stays stuck even after the spec names a
+// class that works.
 func (r *KahunaClusterReconciler) reconcileBackupResources(ctx context.Context, cluster *kahunav1alpha1.KahunaCluster) error {
 	b := cluster.Spec.Backup
 	if b == nil {
@@ -107,6 +116,18 @@ func (r *KahunaClusterReconciler) reconcileBackupResources(ctx context.Context, 
 			}
 		case err != nil:
 			return err
+		case claimNeedsReplacing(existing, desired):
+			// The preconditions pin the delete to the claim just compared: if it bound in the
+			// meantime, it holds data and is left alone. The next pass creates the new claim.
+			err := r.Delete(ctx, existing, client.Preconditions{UID: &existing.UID, ResourceVersion: &existing.ResourceVersion})
+			if apierrors.IsNotFound(err) || apierrors.IsConflict(err) {
+				break
+			}
+			if err != nil {
+				return fmt.Errorf("deleting unbound backup claim: %w", err)
+			}
+			logf.FromContext(ctx).Info("Deleted unbound backup PersistentVolumeClaim to recreate it from spec.backup.volume.claim",
+				"claim", existing.Name)
 		}
 	}
 
@@ -135,6 +156,158 @@ func (r *KahunaClusterReconciler) reconcileBackupResources(ctx context.Context, 
 		}
 	}
 	return nil
+}
+
+// claimNeedsReplacing reports whether the operator's backup claim is unbound and no longer asks for
+// what the spec asks for. A claim that has a volume, or ever had one, is never replaced: it can hold
+// backups. A storage class the spec leaves unset is not compared, because the API server fills in
+// the default class on the claim.
+func claimNeedsReplacing(existing, desired *corev1.PersistentVolumeClaim) bool {
+	if existing.DeletionTimestamp != nil || existing.Spec.VolumeName != "" ||
+		(existing.Status.Phase != "" && existing.Status.Phase != corev1.ClaimPending) {
+		return false
+	}
+	if !sameAccessModes(existing.Spec.AccessModes, desired.Spec.AccessModes) {
+		return true
+	}
+	if want := desired.Spec.StorageClassName; want != nil && !ptr.Equal(existing.Spec.StorageClassName, want) {
+		return true
+	}
+	have := existing.Spec.Resources.Requests[corev1.ResourceStorage]
+	want := desired.Spec.Resources.Requests[corev1.ResourceStorage]
+	return have.Cmp(want) != 0
+}
+
+// sameAccessModes compares two access mode lists as sets.
+func sameAccessModes(a, b []corev1.PersistentVolumeAccessMode) bool {
+	for _, m := range a {
+		if !slices.Contains(b, m) {
+			return false
+		}
+	}
+	for _, m := range b {
+		if !slices.Contains(a, m) {
+			return false
+		}
+	}
+	return true
+}
+
+// backupVolume is what the operator knows about the claim that holds the backups.
+type backupVolume struct {
+	// bound is true when the claim has a volume. Until it has, no pod that mounts it can start,
+	// and no backup can be taken.
+	bound bool
+	// ready is true when the claim is bound and every node can mount it.
+	ready   bool
+	reason  string
+	message string
+}
+
+// conditionReason matches what metav1.Condition accepts as a reason.
+var conditionReason = regexp.MustCompile(`^[A-Za-z]([A-Za-z0-9_,:]*[A-Za-z0-9_])?$`)
+
+// readBackupVolume inspects the backup claim.
+//
+// Every node mounts the claim, so a claim that does not bind keeps every pod Pending and the
+// cluster in bootstrap. The pods show only that they wait for the claim; the cause is in a Warning
+// event on the claim, such as a ProvisioningFailed from a provisioner without ReadWriteMany. That
+// event is copied here, so the KahunaCluster names the cause.
+func (r *KahunaClusterReconciler) readBackupVolume(ctx context.Context, cluster *kahunav1alpha1.KahunaCluster) backupVolume {
+	name := backupClaimName(cluster)
+	pvc := &corev1.PersistentVolumeClaim{}
+	if err := r.Get(ctx, types.NamespacedName{Name: name, Namespace: cluster.Namespace}, pvc); err != nil {
+		if apierrors.IsNotFound(err) {
+			return backupVolume{reason: "ClaimNotFound", message: fmt.Sprintf(
+				"PersistentVolumeClaim %q does not exist. Every node mounts it, so no pod can start until it exists", name)}
+		}
+		return backupVolume{reason: "ClaimUnreadable", message: fmt.Sprintf("reading PersistentVolumeClaim %q: %v", name, err)}
+	}
+
+	switch pvc.Status.Phase {
+	case corev1.ClaimBound:
+		if !singleNode(cluster) && !slices.Contains(pvc.Status.AccessModes, corev1.ReadWriteMany) {
+			return backupVolume{bound: true, reason: "NotReadWriteMany", message: fmt.Sprintf(
+				"PersistentVolumeClaim %q is bound with access modes %v, not ReadWriteMany. Every node mounts it, "+
+					"so a pod that runs on a different Kubernetes node than the volume cannot start", name, pvc.Status.AccessModes)}
+		}
+		return backupVolume{bound: true, ready: true, reason: "ClaimBound",
+			message: fmt.Sprintf("PersistentVolumeClaim %q is bound", name)}
+	case corev1.ClaimLost:
+		return backupVolume{reason: "ClaimLost", message: fmt.Sprintf(
+			"PersistentVolumeClaim %q lost its PersistentVolume %q", name, pvc.Spec.VolumeName)}
+	}
+
+	const stuck = ". Every node mounts it, so no pod can start until it is bound"
+	warning, err := r.latestClaimWarning(ctx, pvc)
+	if err != nil {
+		logf.FromContext(ctx).V(1).Info("could not read backup claim events", "claim", name, "error", err)
+	}
+	if warning == nil {
+		return backupVolume{reason: "ClaimPending", message: fmt.Sprintf("PersistentVolumeClaim %q is not bound yet%s", name, stuck)}
+	}
+
+	reason := warning.Reason
+	if !conditionReason.MatchString(reason) {
+		reason = "ClaimPending"
+	}
+	msg := fmt.Sprintf("PersistentVolumeClaim %q is not bound: %s: %s%s", name, warning.Reason, strings.TrimRight(strings.TrimSpace(warning.Message), "."), stuck)
+	if slices.Contains(pvc.Spec.AccessModes, corev1.ReadWriteMany) {
+		msg += ". The claim asks for ReadWriteMany, so its StorageClass must support that access mode. " +
+			"Set spec.backup.volume.claim.storageClassName to a class that does, or name a ReadWriteMany claim in spec.backup.volume.claimName"
+	}
+	return backupVolume{reason: reason, message: msg}
+}
+
+// latestClaimWarning returns the newest Warning event on the claim, or nil when there is none.
+//
+// Events are read straight from the API server with field selectors. Through the cache, the first
+// read would start an informer on every event in the cluster.
+func (r *KahunaClusterReconciler) latestClaimWarning(ctx context.Context, pvc *corev1.PersistentVolumeClaim) (*corev1.Event, error) {
+	reader := r.Reader
+	if reader == nil {
+		reader = r.Client
+	}
+	var list corev1.EventList
+	if err := reader.List(ctx, &list, client.InNamespace(pvc.Namespace), client.MatchingFields{
+		"involvedObject.kind": "PersistentVolumeClaim",
+		"involvedObject.uid":  string(pvc.UID),
+		"type":                corev1.EventTypeWarning,
+	}); err != nil {
+		return nil, err
+	}
+	var latest *corev1.Event
+	for i := range list.Items {
+		if latest == nil || eventTime(&list.Items[i]).After(eventTime(latest)) {
+			latest = &list.Items[i]
+		}
+	}
+	return latest, nil
+}
+
+// eventTime is when the event was last seen. Which field holds it depends on the API that wrote it.
+func eventTime(e *corev1.Event) time.Time {
+	t := e.CreationTimestamp.Time
+	for _, c := range []time.Time{e.LastTimestamp.Time, e.EventTime.Time} {
+		if c.After(t) {
+			t = c
+		}
+	}
+	if e.Series != nil && e.Series.LastObservedTime.After(t) {
+		t = e.Series.LastObservedTime.Time
+	}
+	return t
+}
+
+// setBackupVolumeCondition writes the BackupVolumeReady condition.
+func setBackupVolumeCondition(cluster *kahunav1alpha1.KahunaCluster, v backupVolume) {
+	st := metav1.ConditionFalse
+	if v.ready {
+		st = metav1.ConditionTrue
+	}
+	apimeta.SetStatusCondition(&cluster.Status.Conditions, metav1.Condition{
+		Type: kahunav1alpha1.ConditionBackupVolumeReady, Status: st, Reason: v.reason, Message: v.message,
+	})
 }
 
 // backupJob is one backup running outside the reconcile loop.
@@ -450,11 +623,15 @@ func (r *KahunaClusterReconciler) reconcileBackup(ctx context.Context, cluster *
 	if spec == nil {
 		cluster.Status.Backup = nil
 		apimeta.RemoveStatusCondition(&cluster.Status.Conditions, kahunav1alpha1.ConditionBackupFailing)
+		apimeta.RemoveStatusCondition(&cluster.Status.Conditions, kahunav1alpha1.ConditionBackupVolumeReady)
 		r.backups.forget(key)
 		return 0
 	}
 	log := logf.FromContext(ctx).WithValues("backupDir", backupPath(cluster))
 	now := time.Now()
+
+	volume := r.readBackupVolume(ctx, cluster)
+	setBackupVolumeCondition(cluster, volume)
 
 	st := &kahunav1alpha1.BackupStatus{}
 	if cluster.Status.Backup != nil {
@@ -517,7 +694,13 @@ func (r *KahunaClusterReconciler) reconcileBackup(ctx context.Context, cluster *
 		setBackupCondition(cluster, failing, failedOr("BackupSuspended"), failure+"backups are suspended")
 		return 0
 	}
-	if reason := backupBlocked(cluster, membership, pods); reason != "" {
+	// The volume comes first: a claim that does not bind keeps every pod Pending, and then the
+	// reason below would only say that bootstrap has not finished.
+	reason := backupBlocked(cluster, membership, pods)
+	if !volume.bound {
+		reason = volume.message
+	}
+	if reason != "" {
 		setBackupCondition(cluster, failing, failedOr("BackupWaiting"),
 			fmt.Sprintf("%s%s backup is due, waiting because %s", failure, d.kind, reason))
 		return 0
@@ -536,10 +719,10 @@ func (r *KahunaClusterReconciler) reconcileBackup(ctx context.Context, cluster *
 		timeout = spec.Timeout.Duration
 	}
 	next := &backupJob{kind: d.kind, scheduled: d.scheduled, parent: st.LastBackupID}
-	parent, kind, client := next.parent, next.kind, r.Kahuna
+	parent, kind, kc := next.parent, next.kind, r.Kahuna
 	log.Info("Starting backup", "kind", kind, "scheduled", d.scheduled, "parentBackupID", parent)
 	r.backups.start(key, next, timeout, log, func(ctx context.Context) (*kahuna.BackupInfo, error) {
-		return runBackup(ctx, client, kind, parent, targets)
+		return runBackup(ctx, kc, kind, parent, targets)
 	})
 
 	setBackupCondition(cluster, failing, failedOr("BackupRunning"),

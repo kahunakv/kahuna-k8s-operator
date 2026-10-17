@@ -224,6 +224,12 @@ func specReplicas(cluster *kahunav1alpha1.KahunaCluster) int32 {
 	return *cluster.Spec.Replicas
 }
 
+// singleNode reports whether the cluster has one node and always will. The CRD refuses to scale a
+// single-node cluster into a multi-node one, and autoscaling starts at 3 nodes.
+func singleNode(cluster *kahunav1alpha1.KahunaCluster) bool {
+	return cluster.Spec.Autoscaling == nil && specReplicas(cluster) == 1
+}
+
 // initialAutoscaledReplicas is where the autoscaler starts before it has chosen anything:
 // spec.replicas, held inside the autoscaling bounds.
 func initialAutoscaledReplicas(cluster *kahunav1alpha1.KahunaCluster) int32 {

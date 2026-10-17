@@ -68,6 +68,10 @@ const (
 	// ConditionBackupFailing is true when the latest scheduled backup failed, or the backup schedule
 	// cannot be parsed. It stays false while backups succeed or wait for the cluster to settle.
 	ConditionBackupFailing = "BackupFailing"
+	// ConditionBackupVolumeReady is true when the backup claim is bound and every node can mount it.
+	// While it is false because the claim is not bound, no pod can start, and the message names the
+	// cause, such as a provisioner that cannot give ReadWriteMany.
+	ConditionBackupVolumeReady = "BackupVolumeReady"
 )
 
 // PVCRetentionPolicy controls what happens to a node's PersistentVolumeClaims when its pod is
@@ -462,8 +466,11 @@ type BackupVolumeSpec struct {
 	ClaimName *string `json:"claimName,omitempty"`
 
 	// claim asks the operator to create a PersistentVolumeClaim named <cluster>-backup. Access
-	// modes default to ReadWriteMany. The operator creates the claim once and does not change it
-	// later. Deleting the KahunaCluster, or removing spec.backup, does not delete the claim.
+	// modes default to ReadWriteMany, or to ReadWriteOnce for a single-node cluster, so the
+	// StorageClass must support ReadWriteMany when the cluster has more than one node. Until the
+	// claim binds, the operator replaces it when this spec changes. After it binds, the operator
+	// does not change it. Deleting the KahunaCluster, or removing spec.backup, does not delete the
+	// claim.
 	// +optional
 	Claim *VolumeSpec `json:"claim,omitempty"`
 }

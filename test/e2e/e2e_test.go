@@ -39,6 +39,8 @@ const (
 	operatorNamespace = "kahuna-operator-system"
 	testNamespace     = "kahuna-e2e"
 	clusterName       = "kahuna"
+	// backupVolumeName names both the hostPath volume and the claim the backup spec mounts.
+	backupVolumeName = "kahuna-e2e-backup"
 
 	// Scale steps are one consensus round plus the operator's requeue interval now that nodes are
 	// asked to leave rather than evicted by the failure detector. The allowance stays generous so
@@ -292,6 +294,7 @@ spec:
 		}
 		By("removing the test namespace")
 		_, _ = kubectl("delete", "namespace", testNamespace, "--wait=false")
+		_, _ = kubectl("delete", "pv", backupVolumeName, "--ignore-not-found", "--wait=false")
 	})
 
 	It("rejects configurations that cannot work", func() {
@@ -489,6 +492,61 @@ spec:
 
 			Expect(kvGet(baseURL, "e2e/key")).To(Equal("before-scale"))
 		})
+	})
+
+	// Kind's only StorageClass, local-path, cannot give ReadWriteMany, so the operator's own claim
+	// would never bind here. A hostPath volume is a correct shared volume on a single Kind node,
+	// because every pod runs on that node.
+	It("takes a scheduled full backup to a shared volume", func() {
+		By("scaling back to the replication factor, which backups require")
+		mustKubectl("-n", testNamespace, "patch", "kahunacluster", clusterName,
+			"--type=merge", "-p", `{"spec":{"replicas":3}}`)
+		expectConverged(3)
+
+		By("creating a ReadWriteMany hostPath volume and a claim bound to it")
+		// A volume left by an earlier run on a reused cluster is Released, and no new claim binds it.
+		mustKubectl("delete", "pv", backupVolumeName, "--ignore-not-found")
+		applyYAML(fmt.Sprintf(`
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: %[1]s
+spec:
+  capacity:
+    storage: 1Gi
+  accessModes: [ReadWriteMany]
+  storageClassName: manual
+  persistentVolumeReclaimPolicy: Retain
+  hostPath:
+    path: /var/local/%[1]s
+    type: DirectoryOrCreate
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: %[1]s
+  namespace: %[2]s
+spec:
+  accessModes: [ReadWriteMany]
+  storageClassName: manual
+  volumeName: %[1]s
+  resources:
+    requests:
+      storage: 1Gi
+`, backupVolumeName, testNamespace))
+
+		mustKubectl("-n", testNamespace, "patch", "kahunacluster", clusterName, "--type=merge", "-p",
+			fmt.Sprintf(`{"spec":{"backup":{"schedule":"@daily","volume":{"claimName":%q}}}}`, backupVolumeName))
+
+		By("waiting for the rollout and the first full backup")
+		Eventually(func() string {
+			return clusterField("{.status.backup.lastBackupID}")
+		}, 2*membershipTimeout, pollInterval).ShouldNot(BeEmpty(), "no backup was taken")
+
+		Expect(clusterField(`{.status.conditions[?(@.type=="BackupVolumeReady")].status}`)).To(Equal("True"))
+		Expect(clusterField(`{.status.conditions[?(@.type=="BackupFailing")].status}`)).To(Equal("False"))
+		Expect(clusterField("{.status.backup.lastBackupType}")).To(Equal(kahuna.BackupTypeFull))
+		expectConverged(3)
 	})
 })
 
