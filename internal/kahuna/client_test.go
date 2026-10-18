@@ -223,6 +223,33 @@ func TestBackupRefusalIsTyped(t *testing.T) {
 	}
 }
 
+// Only refusals that a retry can clear send the backup on to another node. A changed topology and
+// a missing share of the partitions clear on retry; a chain that misses partitions does not.
+func TestBackupOutcomeClassification(t *testing.T) {
+	cases := []struct {
+		outcome     string
+		another     bool
+		clearsLater bool
+	}{
+		{BackupOutcomeNotBackupCoordinator, true, true},
+		{BackupOutcomeRetryableLeadershipLoss, true, true},
+		{BackupOutcomeCutUnverified, true, true},
+		{BackupOutcomeTopologyChanged, true, true},
+		{BackupOutcomePartitionCaptureFailed, true, true},
+		{BackupOutcomeNotConfigured, true, false},
+		{BackupOutcomeParentMissing, false, false},
+		{"RestrictedCoverage", false, false},
+		{"IoError", false, false},
+	}
+	for _, tc := range cases {
+		be := &BackupError{StatusCode: 503, Outcome: tc.outcome}
+		if be.TryAnotherNode() != tc.another || be.ClearsOnRetry() != tc.clearsLater {
+			t.Errorf("%s: TryAnotherNode=%v ClearsOnRetry=%v, want %v %v",
+				tc.outcome, be.TryAnotherNode(), be.ClearsOnRetry(), tc.another, tc.clearsLater)
+		}
+	}
+}
+
 // A backup is not a status read: a full backup copies the whole store, so it must not carry the
 // short read bound.
 func TestBackupIsNotBoundByTheReadTimeout(t *testing.T) {

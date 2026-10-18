@@ -498,10 +498,12 @@ type BackupRetentionSpec struct {
 // BackupSpec turns on scheduled backups to a volume that every node shares.
 //
 // Full backups are coordinated: the server takes them at one cut time that is the same for every
-// partition. Incremental backups add the log written since the latest backup. A backup holds only
-// the partitions that the node taking it hosts, so a backup is restorable only when one node hosts
-// every partition. The KahunaCluster validation therefore refuses spec.backup when a replication
-// factor is set and the cluster can have more nodes than the factor.
+// partition. Incremental backups add the log written since the latest backup. Under a replication
+// factor no node needs to host every partition: Kahuna 1.12.5 and later compose the backup from
+// each node's share of the partitions, so it covers every partition. An older server's backup
+// holds only the partitions that the node taking it hosts, and restore and seeding refuse it, so
+// the operator takes no backup when spec.image names a release before 1.12.5 and the cluster can
+// have more nodes than the factor.
 //
 // Adding, removing or changing anything here except the schedules and suspend changes the server
 // command line, which rolls the cluster one node at a time.
@@ -808,8 +810,9 @@ type BackupStatus struct {
 
 	// unclaimedSince is when the first of the current run of unclaimed attempts ended. An attempt
 	// is unclaimed when no node took it and every node refused with an outcome that clears on its
-	// own once the meta partition has a settled leader. This is what a cluster looks like right
-	// after bootstrap. An unclaimed attempt is retried soon and is not counted as a failure, until
+	// own: the meta partition has no settled leader yet, the topology moved during the backup, or
+	// one node's share of the partitions could not be captured. The first is what a cluster looks
+	// like right after bootstrap. An unclaimed attempt is retried soon and is not counted as a failure, until
 	// the run lasts longer than a bound. Cleared by any other result.
 	// +optional
 	UnclaimedSince *metav1.Time `json:"unclaimedSince,omitempty"`
@@ -902,7 +905,6 @@ type KahunaClusterStatus struct {
 // +kubebuilder:validation:XValidation:rule="self.spec.replicas != 2",message="replicas must not be 2: a two-Voter Raft cluster has a quorum of 2 and therefore tolerates no failures; use 1 or 3"
 // +kubebuilder:validation:XValidation:rule="(oldSelf.spec.replicas == 1) == (self.spec.replicas == 1)",message="a single-node (standalone) cluster cannot be scaled into a multi-node cluster, or vice versa: the two use different quorum models and on-disk identities. Create a new KahunaCluster and migrate the data."
 // +kubebuilder:validation:XValidation:rule="!has(self.spec.autoscaling) || has(self.spec.replication)",message="autoscaling requires spec.replication: without a replication factor every node holds every partition, so adding nodes adds copies rather than capacity"
-// +kubebuilder:validation:XValidation:rule="!has(self.spec.backup) || !has(self.spec.replication) || self.spec.replication.factor >= (has(self.spec.autoscaling) ? self.spec.autoscaling.maxReplicas : (has(self.spec.replicas) ? self.spec.replicas : 3))",message="backup is refused when a replication factor is set and the cluster can have more nodes than the factor: a Kahuna backup holds only the partitions the node taking it hosts, so no backup would cover every partition, and restore and seeding refuse such a backup"
 // +kubebuilder:resource:shortName=kahuna;kc
 // +kubebuilder:printcolumn:name="Desired",type=integer,JSONPath=`.spec.replicas`
 // +kubebuilder:printcolumn:name="Autoscaled",type=integer,JSONPath=`.status.autoscaling.desiredReplicas`

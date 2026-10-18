@@ -23,6 +23,7 @@ import (
 	"fmt"
 	"regexp"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -76,6 +77,16 @@ const (
 	// maxFailureMessage keeps one server error from filling status.
 	maxFailureMessage = 1024
 )
+
+// composedBackupVersion is the first Kahuna release whose coordinated backup covers every
+// partition under a replication factor: the coordinator assigns each partition to a node that
+// hosts it, and merges the nodes' shares, captured at one cut, into one backup. An older server's
+// backup holds only the partitions that the node taking it hosts, and restore and seeding refuse
+// such a backup.
+var composedBackupVersion = [3]int{1, 12, 5}
+
+// imageVersionPattern matches a release tag such as 1.12.6 or v1.12.6-rc.1.
+var imageVersionPattern = regexp.MustCompile(`^v?(\d+)\.(\d+)\.(\d+)(?:[-+].*)?$`)
 
 // backupKind is the kind of backup the scheduler takes.
 type backupKind string
@@ -537,10 +548,77 @@ func backupBlocked(cluster *kahunav1alpha1.KahunaCluster, membership *kahuna.Mem
 			return fmt.Sprintf("%s is not ready", pod.Name)
 		case pod.Annotations[configHashAnnotation] != hash:
 			return fmt.Sprintf("%s does not run the current configuration yet", pod.Name)
+		case podImage(pod) != cluster.Spec.Image:
+			// The script hash does not cover the image. During an image rollout a coordinator can
+			// ask an older node for a share of the partitions that it cannot capture.
+			return fmt.Sprintf("%s does not run image %s yet", pod.Name, cluster.Spec.Image)
 		}
 	}
 	if seen < desired {
 		return fmt.Sprintf("%d of %d pods exist", seen, desired)
+	}
+	return ""
+}
+
+// imageVersion reads the release version from an image's tag. ok is false for an image without a
+// release tag (latest, a branch build, or a digest alone), whose version the operator cannot know.
+func imageVersion(image string) (v [3]int, ok bool) {
+	if i := strings.Index(image, "@"); i >= 0 {
+		image = image[:i]
+	}
+	i := strings.LastIndex(image, ":")
+	if i < 0 || strings.Contains(image[i:], "/") {
+		return v, false
+	}
+	m := imageVersionPattern.FindStringSubmatch(image[i+1:])
+	if m == nil {
+		return v, false
+	}
+	for j := range v {
+		n, err := strconv.Atoi(m[j+1])
+		if err != nil {
+			return v, false
+		}
+		v[j] = n
+	}
+	return v, true
+}
+
+// backupUnsupported returns why the cluster's image cannot take a backup that covers every
+// partition, or "" when it can or when its version is unknown.
+//
+// Under a replication factor smaller than the node count no node hosts every partition, and only
+// Kahuna 1.12.5 and later compose a backup from every node's share. The most nodes the cluster can
+// have decides it, not the current count: a chain started at 3 nodes continues after a scale-up.
+func backupUnsupported(cluster *kahunav1alpha1.KahunaCluster) string {
+	r := cluster.Spec.Replication
+	if r == nil {
+		return ""
+	}
+	most := specReplicas(cluster)
+	if as := cluster.Spec.Autoscaling; as != nil {
+		most = as.MaxReplicas
+	}
+	if r.Factor >= most {
+		return ""
+	}
+	v, ok := imageVersion(cluster.Spec.Image)
+	if !ok || slices.Compare(v[:], composedBackupVersion[:]) >= 0 {
+		return ""
+	}
+	minimum := fmt.Sprintf("%d.%d.%d", composedBackupVersion[0], composedBackupVersion[1], composedBackupVersion[2])
+	return fmt.Sprintf("image %s is older than Kahuna %s, and the cluster can have %d nodes with "+
+		"replication.factor %d: a backup from that server holds only the partitions that the node taking "+
+		"it hosts, and restore and seeding refuse such a backup. Use Kahuna %s or later",
+		cluster.Spec.Image, minimum, most, r.Factor, minimum)
+}
+
+// podImage is the image of the pod's Kahuna container, or "" when it has none.
+func podImage(pod *corev1.Pod) string {
+	for _, c := range pod.Spec.Containers {
+		if c.Name == containerName {
+			return c.Image
+		}
 	}
 	return ""
 }
@@ -552,7 +630,8 @@ type backupTarget struct {
 }
 
 // unclaimedBackupError is a backup that no node took, where every node refused with an outcome
-// that clears on retry. It is what a cluster with no meta-partition leader yet returns.
+// that clears on retry. It is what a cluster with no meta-partition leader yet returns, and what a
+// coordinator returns when one node's share of the partitions did not arrive.
 type unclaimedBackupError struct {
 	refusals []string
 }
@@ -570,8 +649,10 @@ func (e *unclaimedBackupError) Error() string {
 //
 // The cluster is steady before a backup is sent, but that does not mean the meta partition has a
 // leader: right after bootstrap every node can refuse with NotBackupCoordinator, or the node that
-// just took the lead with CutUnverified. When every refusal is of that kind, the result is an
-// *unclaimedBackupError.
+// just took the lead with CutUnverified. Under a replication factor the coordinator also needs a
+// share of the partitions from other nodes, and it refuses with PartitionCaptureFailed when one
+// does not arrive; the next attempt gives that node's partitions to another replica. When every
+// refusal is of a kind that clears on retry, the result is an *unclaimedBackupError.
 func runBackup(ctx context.Context, c kahuna.Client, kind backupKind, parent string, targets []backupTarget) (*kahuna.BackupInfo, error) {
 	var refusals []string
 	clears := true
@@ -636,9 +717,10 @@ func applyBackupResult(st *kahunav1alpha1.BackupStatus, job backupJob, now time.
 		return
 	}
 
-	// No node took the backup, and only because the meta partition has no settled leader yet. This
-	// is not a failure until it lasts longer than the bound: the backup stays due and goes out again
-	// after a short delay. While earlier failures are outstanding, it counts like any other failure.
+	// No node took the backup, and only for a cause that clears on retry: most often the meta
+	// partition has no settled leader yet. This is not a failure until it lasts longer than the
+	// bound: the backup stays due and goes out again after a short delay. While earlier failures are
+	// outstanding, it counts like any other failure.
 	var unclaimed *unclaimedBackupError
 	if errors.As(job.err, &unclaimed) && st.ConsecutiveFailures == 0 {
 		if st.UnclaimedSince == nil {
@@ -717,6 +799,10 @@ func (r *KahunaClusterReconciler) reconcileBackup(ctx context.Context, cluster *
 			return 0
 		}
 	}
+	if reason := backupUnsupported(cluster); reason != "" {
+		setBackupCondition(cluster, true, "UnsupportedImage", reason)
+		return 0
+	}
 
 	failing := st.ConsecutiveFailures > 0
 	failure := ""
@@ -740,7 +826,7 @@ func (r *KahunaClusterReconciler) reconcileBackup(ctx context.Context, cluster *
 	if d.kind == backupNone && !d.retryAt.IsZero() && !failing && st.UnclaimedSince != nil {
 		setBackupCondition(cluster, false, "BackupWaiting", fmt.Sprintf(
 			"a backup is due, but no node has taken it since %s: every node refused it with an outcome that clears "+
-				"once the meta partition has a settled leader. Retrying at %s",
+				"on retry, such as a meta partition with no settled leader yet. Retrying at %s",
 			st.UnclaimedSince.UTC().Format(time.RFC3339), d.retryAt.UTC().Format(time.RFC3339)))
 		return untilDue(d.next, now)
 	}

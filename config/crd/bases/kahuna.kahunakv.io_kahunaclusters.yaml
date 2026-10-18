@@ -2504,8 +2504,9 @@ spec:
                     description: |-
                       unclaimedSince is when the first of the current run of unclaimed attempts ended. An attempt
                       is unclaimed when no node took it and every node refused with an outcome that clears on its
-                      own once the meta partition has a settled leader. This is what a cluster looks like right
-                      after bootstrap. An unclaimed attempt is retried soon and is not counted as a failure, until
+                      own: the meta partition has no settled leader yet, the topology moved during the backup, or
+                      one node's share of the partitions could not be captured. The first is what a cluster looks
+                      like right after bootstrap. An unclaimed attempt is retried soon and is not counted as a failure, until
                       the run lasts longer than a bound. Cleared by any other result.
                     format: date-time
                     type: string
@@ -2694,13 +2695,6 @@ spec:
             every node holds every partition, so adding nodes adds copies rather than
             capacity'
           rule: '!has(self.spec.autoscaling) || has(self.spec.replication)'
-        - message: 'backup is refused when a replication factor is set and the cluster
-            can have more nodes than the factor: a Kahuna backup holds only the partitions
-            the node taking it hosts, so no backup would cover every partition, and
-            restore and seeding refuse such a backup'
-          rule: '!has(self.spec.backup) || !has(self.spec.replication) || self.spec.replication.factor
-            >= (has(self.spec.autoscaling) ? self.spec.autoscaling.maxReplicas : (has(self.spec.replicas)
-            ? self.spec.replicas : 3))'
     served: true
     storage: true
     subresources:

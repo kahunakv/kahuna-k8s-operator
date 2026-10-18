@@ -226,15 +226,17 @@ after that each kind runs on its own schedule, and missed runs collapse into one
 - **Backups run in the background.** A full backup can take many minutes, so the reconcile starts it
   and collects the result on a later pass; scaling and rollouts are not held for it.
 - **A backup waits for a steady cluster:** bootstrap complete, roster converged, and every pod ready
-  on the current configuration. Turning backups on rolls the cluster, and the first backup waits
-  for the rollout to finish.
+  on the current configuration and image. Turning backups on rolls the cluster, and the first
+  backup waits for the rollout to finish.
 - **Status.** `status.backup` records the last backup id and type, the schedule anchors, and the
   failures. The `BackupFailing` condition is true while the latest attempt failed. A failed backup
   stays due and is retried after a backoff (1 minute, doubling to 30). If an incremental's parent is
   gone from the catalog, a new chain starts with a full backup at once.
 - **A steady cluster can still have no backup coordinator.** Right after bootstrap no node leads the
   meta partition yet, so every node can refuse the first backup (`NotBackupCoordinator`, or
-  `CutUnverified` from the node that just took the lead). When every refusal is of that kind, the
+  `CutUnverified` from the node that just took the lead). A topology change during the backup
+  (`TopologyChanged`) and a node's share of the partitions that did not arrive
+  (`PartitionCaptureFailed`) also clear on retry. When every refusal is of these kinds, the
   backup is retried after 15 seconds and is not counted as a failure: `BackupFailing` stays false
   with reason `BackupWaiting`, and `status.backup.unclaimedSince` shows since when. Only if no node
   takes it for 5 minutes is it counted as a failure, with the usual backoff.
@@ -257,12 +259,17 @@ after that each kind runs on its own schedule, and missed runs collapse into one
   removing `backup` keeps both. The server refuses to restore or seed from a signed backup without
   its key.
 
-**Refused under a replication factor the cluster can outgrow.** A Kahuna backup holds only the
-partitions the node taking it hosts, and restore and seeding refuse a backup that does not cover
-every partition. So `backup` is refused when `replication.factor` is less than the most nodes the
-cluster can have (`autoscaling.maxReplicas`, or `replicas`). With the factor capped at 3, that leaves
-backups for clusters without a factor, and for clusters of at most 3 nodes. Lifting this needs a
-server change: kahuna feature `5b5461f9` asks for a coordinated backup that covers every partition.
+**Under a replication factor, backups need Kahuna 1.12.5 or later.** When `replication.factor` is
+less than the most nodes the cluster can have (`autoscaling.maxReplicas`, or `replicas`), no node
+hosts every partition. Kahuna 1.12.5 and later compose the coordinated backup from each node's
+share of the partitions, captured at one cut, so the backup covers every partition. An older
+server's backup holds only the partitions the node taking it hosts, and restore and seeding refuse
+it. So on such a cluster the operator takes no backup when `image` has a release tag before 1.12.5:
+`BackupFailing` is `True` with reason `UnsupportedImage`. The operator cannot read the version of
+an image without a release tag (`latest`, a branch build, a digest alone), and takes backups with
+it. A backup also waits until every pod runs the current `image`, because during an image rollout
+an older node cannot capture its share. If one node's share does not arrive, the server publishes
+nothing and answers `PartitionCaptureFailed`. The operator retries it soon, as above.
 
 **On a single-node Kind cluster,** whose only class is `local-path`, a hostPath PersistentVolume
 gives a working ReadWriteMany claim. It is correct there only because every pod runs on the one
@@ -399,8 +406,8 @@ entrypoint with its own generated startup script.
 - **New nodes catch up through Raft, not from a backup.** A node added by a scale-up joins empty and
   the leader ships it a snapshot plus the log tail. Kahuna 1.12.3 can seed a node itself
   (`--pitr-bootstrap-from latest` copies and verifies the full backup's checkpoint, replays the
-  chain, then joins), but only from a backup that covers every partition. The clusters that scale
-  are the ones with a replication factor, and their backups never do (kahuna feature `5b5461f9`).
+  chain, then joins), but only from a backup that covers every partition. Under a replication
+  factor, Kahuna 1.12.5 and later take such a backup, but the operator does not seed new nodes yet.
 - **Backups go to a shared volume only.** The stock server registers no GCS backup provider (kahuna
   task `19b5142e`), so a bucket cannot be a backup target yet.
 - **`nodeId` reads 0 for founding roster members.** Kommander seeds the initial roster from

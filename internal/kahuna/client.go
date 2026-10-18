@@ -249,6 +249,14 @@ const (
 	BackupOutcomeNotConfigured = "NotConfigured"
 	// BackupOutcomeParentMissing means the catalog has no backup with the requested parent id.
 	BackupOutcomeParentMissing = "ParentMissing"
+	// BackupOutcomeTopologyChanged means the roster or the partition map moved during the backup.
+	// Nothing was published.
+	BackupOutcomeTopologyChanged = "TopologyChanged"
+	// BackupOutcomePartitionCaptureFailed means a cluster-wide backup could not get one node's share
+	// of the partitions: the node refused or failed it, or could not be reached. Nothing was
+	// published. On the next attempt another replica takes the partitions of a node that could not
+	// be reached. Kahuna 1.12.5 and later compose a backup from shares under a replication factor.
+	BackupOutcomePartitionCaptureFailed = "PartitionCaptureFailed"
 )
 
 // BackupInfo is the server's description of one backup (KahunaBackupInfo). Only the fields the
@@ -284,19 +292,22 @@ func (e *BackupError) Error() string {
 func (e *BackupError) TryAnotherNode() bool {
 	switch e.Outcome {
 	case BackupOutcomeNotBackupCoordinator, BackupOutcomeRetryableLeadershipLoss,
-		BackupOutcomeCutUnverified, BackupOutcomeNotConfigured:
+		BackupOutcomeCutUnverified, BackupOutcomeNotConfigured,
+		BackupOutcomeTopologyChanged, BackupOutcomePartitionCaptureFailed:
 		return true
 	}
 	return false
 }
 
 // ClearsOnRetry reports whether the same request can succeed later with nothing changed: the
-// refusal comes from a meta partition with no leader yet, a leader that just moved, or a cut that
-// the transactions in flight overtook. NotConfigured is not one of these: it needs a restart with
-// the backup flags.
+// refusal comes from a meta partition with no leader yet, a leader that just moved, a cut that
+// the transactions in flight overtook, a topology that moved during the backup, or a share of the
+// partitions that a node did not deliver. NotConfigured is not one of these: it needs a restart
+// with the backup flags.
 func (e *BackupError) ClearsOnRetry() bool {
 	switch e.Outcome {
-	case BackupOutcomeNotBackupCoordinator, BackupOutcomeRetryableLeadershipLoss, BackupOutcomeCutUnverified:
+	case BackupOutcomeNotBackupCoordinator, BackupOutcomeRetryableLeadershipLoss, BackupOutcomeCutUnverified,
+		BackupOutcomeTopologyChanged, BackupOutcomePartitionCaptureFailed:
 		return true
 	}
 	return false

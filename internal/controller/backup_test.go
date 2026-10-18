@@ -38,6 +38,13 @@ import (
 // testBackupSchedule is a full-backup schedule far enough apart that one test never sees two runs.
 const testBackupSchedule = "@daily"
 
+// Images for the tests: a release before composed backups, and two tags without a release version.
+const (
+	testOldImage    = "kahunakv/kahuna:1.12.4"
+	testDevImage    = "kahunakv/kahuna:dev"
+	testLatestImage = "kahunakv/kahuna:latest"
+)
+
 func mustSchedule(t *testing.T, s string) cron.Schedule {
 	t.Helper()
 	sched, err := parseSchedule(s)
@@ -230,6 +237,22 @@ func TestBackupRefusedOnlyForWantOfALeaderIsUnclaimed(t *testing.T) {
 	var unclaimed *unclaimedBackupError
 	if !errors.As(err, &unclaimed) || !strings.Contains(err.Error(), "b: ") {
 		t.Fatalf("got %v, want an unclaimed backup that names every refusal", err)
+	}
+}
+
+// Under a replication factor the coordinator refuses when one node's share of the partitions does
+// not arrive, and the other nodes refuse because they do not coordinate. The next attempt gives the
+// missing share to another replica, so this clears on retry like a leader election.
+func TestBackupWithAMissingShareIsUnclaimed(t *testing.T) {
+	notLeader := &kahuna.BackupError{StatusCode: 503, Outcome: kahuna.BackupOutcomeNotBackupCoordinator}
+	share := &kahuna.BackupError{StatusCode: 503, Outcome: kahuna.BackupOutcomePartitionCaptureFailed,
+		Detail: "partition(s) 4, 5 on node kahuna-3: the node could not be reached"}
+	c := &scriptedBackups{answers: map[string]error{"a": notLeader, "b": share, "c": notLeader}}
+
+	_, err := runBackup(context.Background(), c, backupFull, "", targets("a", "b", "c"))
+	var unclaimed *unclaimedBackupError
+	if !errors.As(err, &unclaimed) || !strings.Contains(err.Error(), "partition(s) 4, 5") || len(c.asked) != 3 {
+		t.Fatalf("got %v after asking %v, want an unclaimed backup that names the missing share", err, c.asked)
 	}
 }
 
@@ -509,6 +532,7 @@ func TestEventTimeUsesTheNewestField(t *testing.T) {
 func readyPod(c *kahunav1alpha1.KahunaCluster, ordinal int32, hash string) corev1.Pod {
 	return corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{Name: podName(c, ordinal), Annotations: map[string]string{configHashAnnotation: hash}},
+		Spec:       corev1.PodSpec{Containers: []corev1.Container{{Name: containerName, Image: c.Spec.Image}}},
 		Status: corev1.PodStatus{PodIP: "10.0.0.1", Conditions: []corev1.PodCondition{{
 			Type: corev1.PodReady, Status: corev1.ConditionTrue,
 		}}},
@@ -539,5 +563,82 @@ func TestBackupWaitsForTheRollout(t *testing.T) {
 	}
 	if reason := backupBlocked(c, nil, pods); reason == "" {
 		t.Fatal("not blocked with an unknown roster")
+	}
+}
+
+// The config hash does not cover the image, so an image rollout is checked on its own: under a
+// replication factor the coordinator asks every node for a share of the partitions.
+func TestBackupWaitsForTheImageRollout(t *testing.T) {
+	c := backupCluster()
+	c.Status.Bootstrapped = true
+	hash := configHash(entrypointScript(c))
+	m := &kahuna.Membership{}
+	for i := range int32(3) {
+		m.Members = append(m.Members, kahuna.Member{Endpoint: raftEndpoint(c, i), Role: kahuna.RoleVoter})
+	}
+
+	pods := []corev1.Pod{readyPod(c, 0, hash), readyPod(c, 1, hash), readyPod(c, 2, hash)}
+	pods[2].Spec.Containers[0].Image = testOldImage
+	if reason := backupBlocked(c, m, pods); !strings.Contains(reason, "does not run image") {
+		t.Fatalf("blocked = %q, want the image rollout named", reason)
+	}
+}
+
+func TestImageVersion(t *testing.T) {
+	for image, want := range map[string][3]int{
+		"kahunakv/kahuna:1.12.6":                      {1, 12, 6},
+		"registry.local:5000/kahunakv/kahuna:v1.12.4": {1, 12, 4},
+		"kahunakv/kahuna:1.12.5-rc.1@sha256:abc":      {1, 12, 5},
+	} {
+		if got, ok := imageVersion(image); !ok || got != want {
+			t.Errorf("imageVersion(%q) = %v, %v; want %v", image, got, ok, want)
+		}
+	}
+	for _, image := range []string{
+		"kahunakv/kahuna", testLatestImage, testDevImage,
+		"registry.local:5000/kahunakv/kahuna", "kahunakv/kahuna@sha256:abc", "kahunakv/kahuna:1.12",
+	} {
+		if got, ok := imageVersion(image); ok {
+			t.Errorf("imageVersion(%q) = %v, want no version", image, got)
+		}
+	}
+}
+
+// Only a server before 1.12.5, on a cluster that can have more nodes than the factor, takes a
+// backup that misses partitions. An image without a release tag is not refused.
+func TestBackupUnsupportedOnlyBeforeComposedBackups(t *testing.T) {
+	cases := []struct {
+		name     string
+		image    string
+		replicas int32
+		factor   int32
+		maxNodes int32
+		refused  bool
+	}{
+		{"old server, placed", testOldImage, 5, 3, 0, true},
+		{"old server, autoscaled past the factor", testOldImage, 3, 3, 6, true},
+		{"old server, factor covers every node", testOldImage, 3, 3, 0, false},
+		{"old server, no factor", testOldImage, 5, 0, 0, false},
+		{"composing server", "kahunakv/kahuna:1.12.5", 5, 3, 0, false},
+		{"newer server", "kahunakv/kahuna:1.13.0", 5, 3, 0, false},
+		{"unknown version", testLatestImage, 5, 3, 0, false},
+	}
+	for _, tc := range cases {
+		c := backupCluster()
+		c.Spec.Image = tc.image
+		c.Spec.Replicas = ptr.To(tc.replicas)
+		if tc.factor > 0 {
+			c.Spec.Replication = &kahunav1alpha1.ReplicationSpec{Factor: tc.factor}
+		}
+		if tc.maxNodes > 0 {
+			c.Spec.Autoscaling = &kahunav1alpha1.AutoscalingSpec{MinReplicas: 3, MaxReplicas: tc.maxNodes}
+		}
+		reason := backupUnsupported(c)
+		if (reason != "") != tc.refused {
+			t.Errorf("%s: reason %q, want refused=%v", tc.name, reason, tc.refused)
+		}
+		if tc.refused && !strings.Contains(reason, "Kahuna 1.12.5 or later") {
+			t.Errorf("%s: reason %q does not name the minimum", tc.name, reason)
+		}
 	}
 }

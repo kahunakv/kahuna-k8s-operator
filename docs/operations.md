@@ -85,7 +85,7 @@ Removing autoscaling alone restores the old `spec.replicas` value and may immedi
 
 Image/configuration changes roll pods; topology changes do not restart existing pods just to update seeds. Rollouts hold while the roster is unreadable or nonconverged. Secret content changes alone do not alter the startup-script hash, so keystore rotation must include a deliberate rollout. Default pod anti-affinity is soft; configure placement constraints for required failure-domain separation.
 
-`spec.backup` schedules coordinated full backups, and optionally incrementals, to one ReadWriteMany volume that every node mounts (see the README's *Backups* section). It is refused when a replication factor is set below the most nodes the cluster can have, because a backup covers only the taking node's partitions. Check a cluster's backups with:
+`spec.backup` schedules coordinated full backups, and optionally incrementals, to one ReadWriteMany volume that every node mounts (see the README's *Backups* section). When a replication factor is set below the most nodes the cluster can have, a backup that covers every partition needs Kahuna 1.12.5 or later: the server composes it from each node's share of the partitions. With an older release tag in `image`, the operator takes no backup and sets `BackupFailing` with reason `UnsupportedImage`. Check a cluster's backups with:
 
 ```bash
 kubectl -n kahuna get kahunacluster kahuna -o jsonpath='{.status.backup}{"\n"}'

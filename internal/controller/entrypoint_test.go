@@ -45,7 +45,7 @@ func testCluster(replicas int32) *kahunav1alpha1.KahunaCluster {
 		ObjectMeta: metav1.ObjectMeta{Name: testClusterName, Namespace: "kv"},
 		Spec: kahunav1alpha1.KahunaClusterSpec{
 			Replicas:   ptr.To(replicas),
-			Image:      "kahunakv/kahuna:latest",
+			Image:      testLatestImage,
 			Partitions: ptr.To(int32(3)),
 			Storage: kahunav1alpha1.StorageSpec{
 				Backend: kahunav1alpha1.StorageBackendRocksDB,

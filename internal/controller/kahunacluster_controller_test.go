@@ -194,7 +194,7 @@ var _ = Describe("KahunaCluster Controller", func() {
 			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: namespace},
 			Spec: kahunav1alpha1.KahunaClusterSpec{
 				Replicas:   ptr.To(replicas),
-				Image:      "kahunakv/kahuna:dev",
+				Image:      testDevImage,
 				Partitions: ptr.To(int32(3)),
 				Storage: kahunav1alpha1.StorageSpec{
 					Backend: kahunav1alpha1.StorageBackendRocksDB,
@@ -218,7 +218,7 @@ var _ = Describe("KahunaCluster Controller", func() {
 					Namespace: namespace,
 					Labels:    selectorLabels(cluster),
 				},
-				Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: containerName, Image: "kahunakv/kahuna:dev"}}},
+				Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: containerName, Image: testDevImage}}},
 			}
 			if err := k8sClient.Create(ctx, pod); err != nil {
 				Expect(apierrors.IsAlreadyExists(err)).To(BeTrue(), "%v", err)
@@ -1090,7 +1090,8 @@ var _ = Describe("KahunaCluster Controller", func() {
 			Expect(cond.Reason).To(Equal("NotReadWriteMany"))
 		})
 
-		It("rejects backups when the cluster can outgrow its replication factor", func() {
+		// Kahuna 1.12.5 and later compose a backup that covers every partition from each node's share.
+		It("accepts backups when the cluster can outgrow its replication factor", func() {
 			obj := getCluster()
 			obj.Spec.Replicas = ptr.To(int32(5))
 			obj.Spec.Replication = &kahunav1alpha1.ReplicationSpec{Factor: 3}
@@ -1098,18 +1099,26 @@ var _ = Describe("KahunaCluster Controller", func() {
 				Schedule: testBackupSchedule,
 				Volume:   kahunav1alpha1.BackupVolumeSpec{ClaimName: ptr.To("shared")},
 			}
-			err := k8sClient.Update(ctx, obj)
-			Expect(err).To(HaveOccurred())
-			Expect(err.Error()).To(ContainSubstring("backup is refused when a replication factor is set"))
+			Expect(k8sClient.Update(ctx, obj)).To(Succeed())
+		})
 
-			// Every node hosts every partition when the factor covers the whole cluster.
-			obj = getCluster()
-			obj.Spec.Replication = &kahunav1alpha1.ReplicationSpec{Factor: 3}
+		It("takes no backup when the image is too old to cover every partition under the factor", func() {
+			obj := getCluster()
+			obj.Spec.Image = testOldImage
+			obj.Spec.Replication = &kahunav1alpha1.ReplicationSpec{Factor: 2}
 			obj.Spec.Backup = &kahunav1alpha1.BackupSpec{
 				Schedule: testBackupSchedule,
 				Volume:   kahunav1alpha1.BackupVolumeSpec{ClaimName: ptr.To("shared")},
 			}
 			Expect(k8sClient.Update(ctx, obj)).To(Succeed())
+
+			fake := reconcileUsing(&fakeKahuna{membership: rosterOf(cluster, 3)})
+			Expect(fake.calls()).To(BeEmpty())
+			failing := apimeta.FindStatusCondition(getCluster().Status.Conditions, kahunav1alpha1.ConditionBackupFailing)
+			Expect(failing).NotTo(BeNil())
+			Expect(failing.Status).To(Equal(metav1.ConditionTrue))
+			Expect(failing.Reason).To(Equal("UnsupportedImage"))
+			Expect(failing.Message).To(ContainSubstring("Kahuna 1.12.5"))
 		})
 
 		It("rejects a backup volume that names both a claim and a template", func() {
