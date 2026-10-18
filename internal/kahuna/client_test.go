@@ -258,3 +258,29 @@ func TestIncrementalBackupSendsTheParent(t *testing.T) {
 		t.Fatalf("sent %v, got %+v", got, info)
 	}
 }
+
+// A standalone node lists its two phantom witnesses as Voters. They are not nodes: nothing serves
+// them, so the roster the operator compares against its StatefulSet must not contain them.
+func TestMembershipDropsPhantomWitnesses(t *testing.T) {
+	const body = `{"membershipVersion":1,"members":[` +
+		`{"endpoint":"solo-0.solo-peer.ns.svc.cluster.local:8082","nodeId":1,"role":"Voter","joinedVersion":1},` +
+		`{"endpoint":"embedded-witness-1:0","nodeId":0,"role":"Voter","joinedVersion":1},` +
+		`{"endpoint":"embedded-witness-2:0","nodeId":0,"role":"Voter","joinedVersion":1}],` +
+		`"localRole":"Voter","initialized":true}`
+	srv := delayedServer(t, "/none", body, 0)
+
+	c := &HTTPClient{HTTP: srv.Client(), ReadTimeout: testLeaveTimeout}
+	m, err := c.Membership(context.Background(), srv.URL)
+	if err != nil {
+		t.Fatalf("membership: %v", err)
+	}
+	if len(m.Members) != 1 || len(m.Voters()) != 1 {
+		t.Fatalf("witnesses were kept: %+v", m.Members)
+	}
+	if !m.HasVoter("solo-0.solo-peer.ns.svc.cluster.local:8082") {
+		t.Fatalf("the real node was dropped: %+v", m.Members)
+	}
+	if m.Contains("embedded-witness-1:0") {
+		t.Fatalf("a witness is still in the roster: %+v", m.Members)
+	}
+}

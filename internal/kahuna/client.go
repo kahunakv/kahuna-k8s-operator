@@ -28,6 +28,8 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"slices"
+	"strings"
 	"time"
 )
 
@@ -45,6 +47,17 @@ type Member struct {
 	NodeID        int32  `json:"nodeId"`
 	Role          string `json:"role"`
 	JoinedVersion int64  `json:"joinedVersion"`
+}
+
+// IsWitness reports whether the entry is one of the server's phantom witnesses rather than a node.
+//
+// A standalone node (the operator's single-node cluster) forms its quorum with two witnesses that
+// persist nothing and acknowledge every append; the server lists them in the roster as Voters named
+// "embedded-witness-N:0". No pod serves them and nothing can dial port 0, so the operator never
+// counts them: a roster that keeps them never matches a StatefulSet of one, and the cluster would
+// sit in ScalingDown with backups waiting on a roster that cannot converge.
+func (m Member) IsWitness() bool {
+	return m.NodeID == 0 && strings.HasSuffix(m.Endpoint, ":0")
 }
 
 // Membership is the response of GET /v1/cluster/membership.
@@ -401,6 +414,7 @@ func (c *HTTPClient) Membership(ctx context.Context, baseURL string) (*Membershi
 	if code != http.StatusOK {
 		return nil, fmt.Errorf("membership query returned HTTP %d", code)
 	}
+	m.Members = slices.DeleteFunc(m.Members, Member.IsWitness)
 	return &m, nil
 }
 
