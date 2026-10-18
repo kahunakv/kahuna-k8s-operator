@@ -1193,7 +1193,7 @@ spec:
                   type: string
                 type: array
               image:
-                default: kahunakv/kahuna:1.12.5
+                default: kahunakv/kahuna:1.12.6
                 description: |-
                   image is the Kahuna server image. The operator overrides the image entrypoint with its own
                   generated startup script, so the stock single-node image works unmodified.
