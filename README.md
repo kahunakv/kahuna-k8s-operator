@@ -357,7 +357,7 @@ needs. Set it to `false` when the issuer's CA is in the image's trust store.
 - Kahuna's command-line parser rejects an option it does not define rather than ignoring it, so an
   older server fails at startup on that same flag.
 
-`spec.image` therefore defaults to an exact tag, `kahunakv/kahuna:1.12.6`, rather than to `latest`.
+`spec.image` therefore defaults to an exact tag, `kahunakv/kahuna:1.12.8`, rather than to `latest`.
 A floating tag re-rolls a running cluster on a registry push, and the generated command line is
 version-specific. Raise the tag deliberately, after checking the flags against that release.
 

@@ -46,7 +46,7 @@ var (
 	// --allow-plaintext-listener, which older servers do not define, and Kahuna's parser rejects
 	// an option it does not know rather than ignoring it. A tag older than 1.8.1 here fails every
 	// node at startup.
-	kahunaImage = envOr("KAHUNA_IMAGE", "kahunakv/kahuna:1.12.6")
+	kahunaImage = envOr("KAHUNA_IMAGE", "kahunakv/kahuna:1.12.8")
 )
 
 // envOr reads an environment variable with a fallback.
