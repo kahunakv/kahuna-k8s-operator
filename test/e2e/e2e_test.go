@@ -23,9 +23,11 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"os/exec"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	. "github.com/onsi/ginkgo/v2"
@@ -128,6 +130,12 @@ func withPortForward(fn func(baseURL string)) {
 
 // kvSet writes a key. Durability 1 is Persistent.
 func kvSet(baseURL, key, value string) {
+	ExpectWithOffset(1, kvTrySet(baseURL, key, value)).To(Succeed())
+}
+
+// kvTrySet writes a key and returns why the write did not succeed, without failing the spec. A
+// background writer uses it, where a failed assertion cannot stop the spec.
+func kvTrySet(baseURL, key, value string) error {
 	body := map[string]any{
 		"key":        key,
 		"value":      base64.StdEncoding.EncodeToString([]byte(value)),
@@ -135,15 +143,22 @@ func kvSet(baseURL, key, value string) {
 	}
 	raw, _ := json.Marshal(body)
 	resp, err := http.Post(baseURL+"/v1/kv/try-set", "application/json", strings.NewReader(string(raw)))
-	ExpectWithOffset(1, err).NotTo(HaveOccurred())
+	if err != nil {
+		return err
+	}
 	defer func() { _ = resp.Body.Close() }()
 
 	var out struct {
 		Type int `json:"type"`
 	}
-	ExpectWithOffset(1, json.NewDecoder(resp.Body).Decode(&out)).To(Succeed())
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return err
+	}
 	// 0 is KeyValueResponseType.Set.
-	ExpectWithOffset(1, out.Type).To(Equal(0), "set did not succeed")
+	if out.Type != 0 {
+		return fmt.Errorf("set of %s returned type %d", key, out.Type)
+	}
+	return nil
 }
 
 // kvGet reads a key back.
@@ -178,7 +193,7 @@ spec:
   replicas: %d
   image: %s
   imagePullPolicy: IfNotPresent
-  partitions: 3
+  partitions: 6
   storage:
     backend: rocksdb
     data:
@@ -497,11 +512,22 @@ spec:
 	// Kind's only StorageClass, local-path, cannot give ReadWriteMany, so the operator's own claim
 	// would never bind here. A hostPath volume is a correct shared volume on a single Kind node,
 	// because every pod runs on that node.
-	It("takes a scheduled full backup to a shared volume", func() {
-		By("scaling back to the replication factor, which backups require")
-		mustKubectl("-n", testNamespace, "patch", "kahunacluster", clusterName,
-			"--type=merge", "-p", `{"spec":{"replicas":3}}`)
-		expectConverged(3)
+	//
+	// The cluster has 4 nodes and replication factor 3, so no node hosts every data partition.
+	// Kahuna 1.12.5 and later compose the backup from each node's share of the partitions. The
+	// server's chain validation refuses a chain that misses a partition (RestrictedCoverage), as
+	// restore and seeding do, so a chain that validates is a chain that covers the cluster.
+	It("takes backups that cover every partition under a replication factor", func() {
+		withPortForward(func(baseURL string) {
+			By("checking that no node hosts every data partition")
+			Eventually(func() (string, error) {
+				p, err := placement(baseURL)
+				if err != nil {
+					return "", err
+				}
+				return nodeHostingEveryPartition(p), nil
+			}, membershipTimeout, pollInterval).Should(BeEmpty(), "one node hosts every data partition")
+		})
 
 		By("creating a ReadWriteMany hostPath volume and a claim bound to it")
 		// A volume left by an earlier run on a reused cluster is Released, and no new claim binds it.
@@ -535,20 +561,132 @@ spec:
       storage: 1Gi
 `, backupVolumeName, testNamespace))
 
+		before := podUIDs()
 		mustKubectl("-n", testNamespace, "patch", "kahunacluster", clusterName, "--type=merge", "-p",
-			fmt.Sprintf(`{"spec":{"backup":{"schedule":"@daily","volume":{"claimName":%q}}}}`, backupVolumeName))
+			fmt.Sprintf(`{"spec":{"backup":{"schedule":"@daily","incrementalSchedule":"* * * * *","volume":{"claimName":%q}}}}`,
+				backupVolumeName))
 
 		By("waiting for the rollout and the first full backup")
+		// The backup flags roll every pod. A port-forward opened before the roll ends would die
+		// with the pod it is bound to.
+		expectRolled(before)
+		expectConverged(4)
 		Eventually(func() string {
 			return clusterField("{.status.backup.lastBackupID}")
 		}, 2*membershipTimeout, pollInterval).ShouldNot(BeEmpty(), "no backup was taken")
 
 		Expect(clusterField(`{.status.conditions[?(@.type=="BackupVolumeReady")].status}`)).To(Equal("True"))
 		Expect(clusterField(`{.status.conditions[?(@.type=="BackupFailing")].status}`)).To(Equal("False"))
-		Expect(clusterField("{.status.backup.lastBackupType}")).To(Equal(kahuna.BackupTypeFull))
-		expectConverged(3)
+		full := clusterField("{.status.backup.lastBackupID}")
+
+		withPortForward(func(baseURL string) {
+			By("checking the full backup's chain covers every partition")
+			chain, err := backupChain(baseURL, full)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(chain).NotTo(BeEmpty())
+			Expect(chain[0].Type).To(Equal(kahuna.BackupTypeFull))
+
+			By("writing under load while an incremental backup is taken")
+			stop := make(chan struct{})
+			var written atomic.Int64
+			done := make(chan struct{})
+			go func() {
+				defer GinkgoRecover()
+				defer close(done)
+				for i := 0; ; i++ {
+					select {
+					case <-stop:
+						return
+					default:
+					}
+					if kvTrySet(baseURL, fmt.Sprintf("e2e/load/%d", i), "under-backup") == nil {
+						written.Add(1)
+					}
+				}
+			}()
+			defer func() {
+				close(stop)
+				<-done
+			}()
+
+			Eventually(func() string {
+				return clusterField("{.status.backup.lastBackupType}")
+			}, membershipTimeout, pollInterval).Should(Equal(kahuna.BackupTypeIncremental),
+				"no incremental backup was taken")
+			incremental := clusterField("{.status.backup.lastBackupID}")
+
+			By("checking the incremental's chain covers every partition")
+			chain, err = backupChain(baseURL, incremental)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(len(chain)).To(BeNumerically(">=", 2), "the incremental is not on a chain")
+			Expect(chain[0].Type).To(Equal(kahuna.BackupTypeFull))
+			Expect(chain[len(chain)-1].BackupID).To(Equal(incremental))
+
+			Expect(written.Load()).To(BeNumerically(">", 0), "no write succeeded during the backups")
+			Expect(clusterField(`{.status.conditions[?(@.type=="BackupFailing")].status}`)).To(Equal("False"))
+			Expect(kvGet(baseURL, "e2e/key")).To(Equal("before-scale"))
+		})
+		expectConverged(4)
 	})
 })
+
+// expectRolled waits until every pod in before was replaced, which is how a roll is observed.
+func expectRolled(before map[string]string) {
+	EventuallyWithOffset(1, func() bool {
+		after := podUIDs()
+		if len(after) != len(before) {
+			return false
+		}
+		for name, uid := range before {
+			if after[name] == uid {
+				return false
+			}
+		}
+		return true
+	}, membershipTimeout, pollInterval).Should(BeTrue(), "the cluster never rolled")
+}
+
+// nodeHostingEveryPartition returns a node that hosts a replica of every active data partition,
+// or "" when there is none. Partition 0 is the system partition, which spans every node.
+func nodeHostingEveryPartition(p *kahuna.Placement) string {
+	hosted := map[string]int{}
+	data := 0
+	for _, part := range p.Partitions {
+		if part.PartitionID == 0 || part.State != kahuna.PartitionStateActive {
+			continue
+		}
+		data++
+		for _, r := range part.Replicas {
+			hosted[r.Endpoint]++
+		}
+	}
+	for endpoint, n := range hosted {
+		if n == data {
+			return endpoint
+		}
+	}
+	return ""
+}
+
+// backupChain resolves and validates the chain that ends at leaf, as a restore would. The server
+// refuses a chain that misses a partition with RestrictedCoverage.
+func backupChain(baseURL, leaf string) ([]kahuna.BackupInfo, error) {
+	resp, err := http.Get(baseURL + "/v1/backups/" + leaf + "/chain")
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("chain of %s returned HTTP %d (%s): %s",
+			leaf, resp.StatusCode, resp.Header.Get("X-Kahuna-Backup-Outcome"), body)
+	}
+	var chain []kahuna.BackupInfo
+	if err := json.NewDecoder(resp.Body).Decode(&chain); err != nil {
+		return nil, err
+	}
+	return chain, nil
+}
 
 // placement reads the committed replica sets through the client service.
 func placement(baseURL string) (*kahuna.Placement, error) {
