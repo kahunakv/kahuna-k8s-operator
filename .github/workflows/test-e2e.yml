@@ -11,7 +11,10 @@ jobs:
     permissions:
       contents: read
     name: Run on Ubuntu
-    runs-on: ubuntu-latest
+    # Pinned rather than ubuntu-latest, which GitHub is moving to ubuntu-26.04. On that image
+    # kind failed to load the multi-platform Kahuna image ("ctr: content digest ... not found"),
+    # so every run failed in BeforeSuite.
+    runs-on: ubuntu-24.04
     # The suite walks a real cluster through bootstrap, a scale out and back, and a rolling
     # restart. Each membership change waits out SWIM's suspicion and eviction-grace windows, so
     # the wall-clock floor is minutes and no tuning removes it.
@@ -27,9 +30,15 @@ jobs:
         with:
           go-version-file: go.mod
 
-      - name: Install the latest version of kind
+      # A fixed release rather than dl/latest, which serves whatever alpha build is newest and so
+      # changes the cluster under test between two runs of the same commit.
+      - name: Install kind
+        env:
+          KIND_VERSION: v0.33.0
+          KIND_SHA256: aee6151561422756b764a4ae28e7f44cda5af5a9eead3cc9985112b1de8d8e0d
         run: |
-          curl -Lo ./kind https://kind.sigs.k8s.io/dl/latest/kind-linux-$(go env GOARCH)
+          curl -fsSLo ./kind "https://github.com/kubernetes-sigs/kind/releases/download/${KIND_VERSION}/kind-linux-amd64"
+          echo "${KIND_SHA256}  ./kind" | sha256sum --check
           chmod +x ./kind
           sudo mv ./kind /usr/local/bin/kind
 
