@@ -47,6 +47,11 @@ var (
 	// an option it does not know rather than ignoring it. A tag older than 1.8.1 here fails every
 	// node at startup.
 	kahunaImage = envOr("KAHUNA_IMAGE", "kahunakv/kahuna:1.12.8")
+	// kahunaPreviousImage is the release the upgrade spec founds a cluster on before it moves that
+	// cluster to kahunaImage. It is the operator's default image before kahunaImage, so the spec
+	// follows the path a user takes when the default moves. Raise it with kahunaImage. The same
+	// 1.8.1 floor applies.
+	kahunaPreviousImage = envOr("KAHUNA_PREVIOUS_IMAGE", "kahunakv/kahuna:1.12.6")
 )
 
 // envOr reads an environment variable with a fallback.
@@ -81,13 +86,15 @@ var _ = BeforeSuite(func() {
 	err = utils.LoadImageToKindClusterWithName(managerImage)
 	ExpectWithOffset(1, err).NotTo(HaveOccurred(), "Failed to load the manager image into Kind")
 
-	// Kind nodes cannot pull from the host's daemon, so the server image is pulled once here and
+	// Kind nodes cannot pull from the host's daemon, so the server images are pulled once here and
 	// sideloaded. Doing it in BeforeSuite also keeps the pull out of the per-spec timeouts.
-	By("pulling and loading the Kahuna server image " + kahunaImage)
-	_, err = utils.Run(exec.Command("docker", "pull", kahunaImage))
-	ExpectWithOffset(1, err).NotTo(HaveOccurred(), "Failed to pull the Kahuna server image")
-	err = utils.LoadImageToKindClusterWithName(kahunaImage)
-	ExpectWithOffset(1, err).NotTo(HaveOccurred(), "Failed to load the Kahuna server image into Kind")
+	for _, image := range []string{kahunaImage, kahunaPreviousImage} {
+		By("pulling and loading the Kahuna server image " + image)
+		_, err = utils.Run(exec.Command("docker", "pull", image))
+		ExpectWithOffset(1, err).NotTo(HaveOccurred(), "Failed to pull the Kahuna server image %s", image)
+		err = utils.LoadImageToKindClusterWithName(image)
+		ExpectWithOffset(1, err).NotTo(HaveOccurred(), "Failed to load the Kahuna server image %s into Kind", image)
+	}
 
 	configureKubectlKubeRC()
 	setupCertManager()

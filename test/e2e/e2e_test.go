@@ -86,29 +86,46 @@ func clusterField(path string) string {
 // podUIDs maps pod name to UID, which is how a restart is detected: a restarted pod keeps its
 // name but gets a new UID.
 func podUIDs() map[string]string {
+	return podFieldOf(clusterName, "{.metadata.uid}")
+}
+
+// podImagesOf maps each pod of the named cluster to the image of its Kahuna container.
+func podImagesOf(cluster string) map[string]string {
+	return podFieldOf(cluster, `{.spec.containers[?(@.name=="kahuna")].image}`)
+}
+
+// podFieldOf maps each pod of the named cluster to a jsonpath expression read off that pod.
+func podFieldOf(cluster, path string) map[string]string {
 	out, err := kubectl("-n", testNamespace, "get", "pods",
-		"-l", "app.kubernetes.io/instance="+clusterName,
-		"-o", `jsonpath={range .items[*]}{.metadata.name}={.metadata.uid} {end}`)
-	uids := map[string]string{}
+		"-l", "app.kubernetes.io/instance="+cluster,
+		"-o", `jsonpath={range .items[*]}{.metadata.name}=`+path+` {end}`)
+	fields := map[string]string{}
 	if err != nil {
-		return uids
+		return fields
 	}
 	for _, kv := range strings.Fields(out) {
-		if name, uid, ok := strings.Cut(kv, "="); ok {
-			uids[name] = uid
+		if name, value, ok := strings.Cut(kv, "="); ok {
+			fields[name] = value
 		}
 	}
-	return uids
+	return fields
 }
 
 // withPortForward opens a port-forward to the client Service and runs fn against it. Pod and
 // Service IPs inside Kind are not routable from the test process, so this is how the suite talks
 // to the cluster it just built.
 func withPortForward(fn func(baseURL string)) {
+	GinkgoHelper()
+	withPortForwardTo(clusterName, fn)
+}
+
+// withPortForwardTo is withPortForward for the named cluster.
+func withPortForwardTo(cluster string, fn func(baseURL string)) {
+	GinkgoHelper()
 	const localPort = 32070
 	cmd := exec.Command("kubectl", "-n", testNamespace, "port-forward",
-		"svc/"+clusterName, fmt.Sprintf("%d:2070", localPort))
-	ExpectWithOffset(1, cmd.Start()).To(Succeed())
+		"svc/"+cluster, fmt.Sprintf("%d:2070", localPort))
+	Expect(cmd.Start()).To(Succeed())
 	defer func() {
 		_ = cmd.Process.Kill()
 		_ = cmd.Wait()
@@ -116,7 +133,7 @@ func withPortForward(fn func(baseURL string)) {
 
 	baseURL := fmt.Sprintf("http://localhost:%d", localPort)
 	// The forward takes a moment to bind; poll rather than sleep a fixed amount.
-	EventuallyWithOffset(1, func() error {
+	Eventually(func() error {
 		resp, err := http.Get(baseURL + "/")
 		if err != nil {
 			return err
@@ -181,8 +198,13 @@ func kvGet(baseURL, key string) string {
 	return string(decoded)
 }
 
-// clusterManifest renders a KahunaCluster at the given size.
+// clusterManifest renders the KahunaCluster at the given size.
 func clusterManifest(replicas int, extraArgs string) string {
+	return clusterManifestFor(clusterName, kahunaImage, replicas, extraArgs)
+}
+
+// clusterManifestFor renders a KahunaCluster with the given name, image and size.
+func clusterManifestFor(name, image string, replicas int, extraArgs string) string {
 	return fmt.Sprintf(`
 apiVersion: kahuna.kahunakv.io/v1alpha1
 kind: KahunaCluster
@@ -209,7 +231,7 @@ spec:
       cpu: 100m
       memory: 256Mi
 %s
-`, clusterName, testNamespace, replicas, kahunaImage, extraArgs)
+`, name, testNamespace, replicas, image, extraArgs)
 }
 
 // dumpClusterState prints what a failed spec left behind: the KahunaCluster, its pods and
@@ -223,7 +245,7 @@ func dumpClusterState() {
 		}
 		_, _ = fmt.Fprintf(GinkgoWriter, "===== kubectl %s =====\n%s\n", strings.Join(args, " "), out)
 	}
-	show("-n", testNamespace, "get", "kahunacluster", clusterName, "-o", "yaml")
+	show("-n", testNamespace, "get", "kahunacluster", "-o", "yaml")
 	show("-n", testNamespace, "get", "pods,sts,svc,pvc,certificate", "-o", "wide")
 	show("-n", testNamespace, "get", "events", "--sort-by=.lastTimestamp")
 	show("-n", testNamespace, "describe", "pods")
@@ -242,14 +264,24 @@ func dumpClusterState() {
 
 // expectConverged waits for the operator to report a converged cluster of the given size.
 func expectConverged(replicas int) {
-	EventuallyWithOffset(1, func() string {
+	GinkgoHelper()
+	expectConvergedOf(clusterName, replicas)
+}
+
+// expectConvergedOf is expectConverged for the named cluster.
+func expectConvergedOf(cluster string, replicas int) {
+	GinkgoHelper()
+	field := func(path string) string {
+		return clusterFieldIn(testNamespace, "kahunacluster", cluster, path)
+	}
+	Eventually(func() string {
 		return fmt.Sprintf("%s/%s/%s",
-			clusterField("{.status.voters}"),
-			clusterField("{.status.readyReplicas}"),
-			clusterField("{.status.phase}"))
+			field("{.status.voters}"),
+			field("{.status.readyReplicas}"),
+			field("{.status.phase}"))
 	}, membershipTimeout, pollInterval).Should(
 		Equal(fmt.Sprintf("%d/%d/Running", replicas, replicas)),
-		"cluster never converged at %d nodes", replicas)
+		"%s never converged at %d nodes", cluster, replicas)
 }
 
 var _ = Describe("KahunaCluster", Ordered, func() {
@@ -628,12 +660,75 @@ spec:
 		})
 		expectConverged(4)
 	})
+
+	// The other specs run kahunaImage from the start. This one founds a second cluster on the
+	// previous release and then moves it to kahunaImage, which is how a user upgrades. The cluster
+	// above stays up, so this spec runs at its end, where no spec counts the namespace's revisions.
+	It("upgrades a running cluster to a new Kahuna release, keeping its data", func() {
+		const upgraded = clusterName + "-upgrade"
+		field := func(path string) string {
+			return clusterFieldIn(testNamespace, "kahunacluster", upgraded, path)
+		}
+
+		applyYAML(clusterManifestFor(upgraded, kahunaPreviousImage, 3, ""))
+		expectConvergedOf(upgraded, 3)
+		Expect(field("{.status.currentImage}")).To(Equal(kahunaPreviousImage))
+
+		withPortForwardTo(upgraded, func(baseURL string) {
+			kvSet(baseURL, "e2e/upgrade", "before-upgrade")
+		})
+
+		before := podFieldOf(upgraded, "{.metadata.uid}")
+		Expect(before).To(HaveLen(3))
+		mustKubectl("-n", testNamespace, "patch", "kahunacluster", upgraded,
+			"--type=merge", "-p", fmt.Sprintf(`{"spec":{"image":%q}}`, kahunaImage))
+
+		By("checking currentImage moves only once every node runs the new image")
+		// currentImage is read before the pods, and a replaced pod never goes back to the old
+		// image. So a cluster that reports the new image while a pod still runs the old one is a
+		// real failure, not a race between the two reads.
+		Eventually(func() string {
+			current := field("{.status.currentImage}")
+			images := podImagesOf(upgraded)
+			if current == kahunaImage {
+				for pod, image := range images {
+					Expect(image).To(Equal(kahunaImage),
+						"currentImage is %s while %s still runs %s", current, pod, image)
+				}
+			}
+			return current
+		}, membershipTimeout, pollInterval).Should(Equal(kahunaImage), "currentImage never moved to the new image")
+
+		expectRolledOf(upgraded, before)
+		expectConvergedOf(upgraded, 3)
+
+		By("checking no node crash-looped through the upgrade")
+		restarts := podFieldOf(upgraded, "{.status.containerStatuses[0].restartCount}")
+		Expect(restarts).To(HaveLen(3))
+		for pod, r := range restarts {
+			Expect(r).To(Equal("0"), "%s restarted during the upgrade", pod)
+		}
+
+		withPortForwardTo(upgraded, func(baseURL string) {
+			By("checking the data written on the previous release survived")
+			Expect(kvGet(baseURL, "e2e/upgrade")).To(Equal("before-upgrade"))
+			kvSet(baseURL, "e2e/upgrade", "after-upgrade")
+			Expect(kvGet(baseURL, "e2e/upgrade")).To(Equal("after-upgrade"))
+		})
+	})
 })
 
 // expectRolled waits until every pod in before was replaced, which is how a roll is observed.
 func expectRolled(before map[string]string) {
-	EventuallyWithOffset(1, func() bool {
-		after := podUIDs()
+	GinkgoHelper()
+	expectRolledOf(clusterName, before)
+}
+
+// expectRolledOf is expectRolled for the named cluster.
+func expectRolledOf(cluster string, before map[string]string) {
+	GinkgoHelper()
+	Eventually(func() bool {
+		after := podFieldOf(cluster, "{.metadata.uid}")
 		if len(after) != len(before) {
 			return false
 		}

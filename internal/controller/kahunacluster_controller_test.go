@@ -570,6 +570,61 @@ var _ = Describe("KahunaCluster Controller", func() {
 		Expect(getSTS().Spec.Template.Annotations[configHashAnnotation]).NotTo(Equal(before))
 	})
 
+	It("reports the new image as current only once every node runs it and is ready", func() {
+		reconcileWith(rosterOf(cluster, 3), nil)
+		Expect(getCluster().Status.CurrentImage).To(Equal(testDevImage))
+
+		obj := getCluster()
+		obj.Spec.Image = testLatestImage
+		Expect(k8sClient.Update(ctx, obj)).To(Succeed())
+
+		// replacePod stands in for the StatefulSet controller replacing one pod on the new template.
+		replacePod := func(ordinal int32, ready bool) {
+			pod := &corev1.Pod{}
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: podName(cluster, ordinal), Namespace: namespace}, pod)).To(Succeed())
+			pod.Spec.Containers[0].Image = testLatestImage
+			Expect(k8sClient.Update(ctx, pod)).To(Succeed())
+			status := corev1.ConditionFalse
+			if ready {
+				status = corev1.ConditionTrue
+			}
+			pod.Status.Conditions = []corev1.PodCondition{{
+				Type: corev1.PodReady, Status: status, LastTransitionTime: metav1.Now(),
+			}}
+			Expect(k8sClient.Status().Update(ctx, pod)).To(Succeed())
+		}
+		expectRollingOut := func() {
+			out := getCluster()
+			Expect(out.Status.CurrentImage).To(Equal(testDevImage))
+			Expect(out.Status.Phase).To(Equal(kahunav1alpha1.PhaseUpgrading))
+			progressing := apimeta.FindStatusCondition(out.Status.Conditions, kahunav1alpha1.ConditionProgressing)
+			Expect(progressing).NotTo(BeNil())
+			Expect(progressing.Status).To(Equal(metav1.ConditionTrue))
+			Expect(progressing.Message).To(ContainSubstring("rolling out image " + testLatestImage))
+		}
+
+		// No pod runs the new image yet.
+		reconcileWith(rosterOf(cluster, 3), nil)
+		expectRollingOut()
+
+		// Between two pod restarts every node is ready, but one still runs the old image.
+		replacePod(2, true)
+		replacePod(1, true)
+		reconcileWith(rosterOf(cluster, 3), nil)
+		expectRollingOut()
+
+		// The last node runs the new image but has not started: a stuck rollout.
+		replacePod(0, false)
+		reconcileWith(rosterOf(cluster, 3), nil)
+		expectRollingOut()
+
+		replacePod(0, true)
+		reconcileWith(rosterOf(cluster, 3), nil)
+		out := getCluster()
+		Expect(out.Status.CurrentImage).To(Equal(testLatestImage))
+		Expect(out.Status.Phase).To(Equal(kahunav1alpha1.PhaseRunning))
+	})
+
 	Context("with autoscaling", func() {
 		// steadyLoad returns a metrics source where every node admits writesPerNode writes per
 		// second. Each call advances the node's clock by 15 s, past the sampler's minimum interval.

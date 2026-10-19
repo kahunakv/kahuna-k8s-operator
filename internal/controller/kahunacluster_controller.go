@@ -349,7 +349,12 @@ func (r *KahunaClusterReconciler) reconcileStatus(ctx context.Context, cluster *
 	status.ObservedGeneration = cluster.Generation
 	status.Replicas = sts.Status.Replicas
 	status.ReadyReplicas = sts.Status.ReadyReplicas
-	status.CurrentImage = cluster.Spec.Image
+	// currentImage names what the nodes run, not what they were asked to run. It moves only once
+	// every node runs the new image and is ready, so a stuck rollout still shows the image the
+	// cluster ran before.
+	if imageRolledOut(cluster, sts, pods) {
+		status.CurrentImage = cluster.Spec.Image
+	}
 	sel, err := metav1.LabelSelectorAsSelector(selector(cluster))
 	if err != nil {
 		return ctrl.Result{}, err
@@ -377,7 +382,10 @@ func (r *KahunaClusterReconciler) reconcileStatus(ctx context.Context, cluster *
 	}
 
 	rosterConverged := rosterKnown && status.Voters == desired && status.Learners == 0
-	progressing := status.ReadyReplicas < desired || !rosterConverged
+	// An image rollout can sit between two pod restarts with every node ready, so readiness alone
+	// would report the cluster Running half-way through it.
+	imageCurrent := status.CurrentImage == cluster.Spec.Image
+	progressing := status.ReadyReplicas < desired || !rosterConverged || !imageCurrent
 
 	// Degraded is reserved for a cluster that is actually in trouble — quorum lost, or its state
 	// unreadable. A cluster part-way through a scale is working exactly as intended, and
@@ -402,9 +410,12 @@ func (r *KahunaClusterReconciler) reconcileStatus(ctx context.Context, cluster *
 	setCondition(status, conditionKeystoreReady, keystoreReady,
 		"KeystoreAvailable", "KeystorePending", keystoreOrDefault(keystoreMsg))
 
+	progressMsg := fmt.Sprintf("%d/%d nodes ready, %d voters", status.ReadyReplicas, desired, status.Voters)
+	if !imageCurrent {
+		progressMsg += fmt.Sprintf(", rolling out image %s", cluster.Spec.Image)
+	}
 	setCondition(status, kahunav1alpha1.ConditionProgressing, progressing,
-		"Converging", "Converged",
-		fmt.Sprintf("%d/%d nodes ready, %d voters", status.ReadyReplicas, desired, status.Voters))
+		"Converging", "Converged", progressMsg)
 	setCondition(status, kahunav1alpha1.ConditionRosterConverged, rosterConverged,
 		"RosterMatchesSpec", "RosterDiffers",
 		rosterMessage(rosterKnown, status.Voters, status.Learners, desired))
@@ -430,6 +441,28 @@ func (r *KahunaClusterReconciler) reconcileStatus(ctx context.Context, cluster *
 		return ctrl.Result{RequeueAfter: requeueAutoscaling}, nil
 	}
 	return ctrl.Result{RequeueAfter: requeueSteady}, nil
+}
+
+// imageRolledOut reports whether every node the StatefulSet now has runs the cluster's image and
+// is ready. The StatefulSet's own counters cannot answer this: the operator holds the
+// rolling-update partition, and a revision also changes with the configuration.
+func imageRolledOut(cluster *kahunav1alpha1.KahunaCluster, sts *appsv1.StatefulSet, pods []corev1.Pod) bool {
+	replicas := int32(0)
+	if sts.Spec.Replicas != nil {
+		replicas = *sts.Spec.Replicas
+	}
+	seen := int32(0)
+	for i := range pods {
+		pod := &pods[i]
+		if o := ordinalOf(pod.Name); o < 0 || o >= replicas {
+			continue
+		}
+		if pod.DeletionTimestamp != nil || !podIsReady(pod) || podImage(pod) != cluster.Spec.Image {
+			return false
+		}
+		seen++
+	}
+	return replicas > 0 && seen == replicas
 }
 
 // keystoreOrDefault supplies a message for the ready case, where there is nothing to explain.

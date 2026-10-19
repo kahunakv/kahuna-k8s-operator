@@ -871,7 +871,9 @@ type KahunaClusterStatus struct {
 	// +optional
 	BootstrapSize int32 `json:"bootstrapSize,omitempty"`
 
-	// currentImage is the image the fully-rolled-out nodes are running.
+	// currentImage is the image that every node runs. It changes to spec.image only when every
+	// node runs that image and is ready. During an image rollout, and when a rollout is stuck,
+	// it keeps the image that the cluster ran before.
 	// +optional
 	CurrentImage string `json:"currentImage,omitempty"`
 
