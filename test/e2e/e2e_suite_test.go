@@ -46,12 +46,12 @@ var (
 	// --allow-plaintext-listener, which older servers do not define, and Kahuna's parser rejects
 	// an option it does not know rather than ignoring it. A tag older than 1.8.1 here fails every
 	// node at startup.
-	kahunaImage = envOr("KAHUNA_IMAGE", "kahunakv/kahuna:1.12.8")
+	kahunaImage = envOr("KAHUNA_IMAGE", "kahunakv/kahuna:1.12.9")
 	// kahunaPreviousImage is the release the upgrade spec founds a cluster on before it moves that
 	// cluster to kahunaImage. It is the operator's default image before kahunaImage, so the spec
 	// follows the path a user takes when the default moves. Raise it with kahunaImage. The same
 	// 1.8.1 floor applies.
-	kahunaPreviousImage = envOr("KAHUNA_PREVIOUS_IMAGE", "kahunakv/kahuna:1.12.6")
+	kahunaPreviousImage = envOr("KAHUNA_PREVIOUS_IMAGE", "kahunakv/kahuna:1.12.8")
 )
 
 // envOr reads an environment variable with a fallback.

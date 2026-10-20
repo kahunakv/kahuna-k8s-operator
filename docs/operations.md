@@ -9,7 +9,7 @@ Any founding size works on Kahuna 1.12.3 or later. Give the cluster enough parti
 ```yaml
 spec:
   replicas: 4
-  image: kahunakv/kahuna:1.12.8
+  image: kahunakv/kahuna:1.12.9
   partitions: 16
   replication:
     factor: 3
